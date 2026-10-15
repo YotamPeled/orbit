@@ -1,0 +1,17 @@
+# Two-pair fixture: alpha/prod stays under clusters/apps; alpha/dev moves to
+# clusters/orbit when instance config lists it in orbitd.applyPairs.
+version: 3
+projects:
+  - id: alpha
+    name: Alpha
+    hosted: self
+    environments:
+      prod: {}
+      dev:
+        enabled: true
+    components:
+      - name: web
+        kind: web
+        image: example/web
+        port: 8080
+        path: /

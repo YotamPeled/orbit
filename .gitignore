@@ -1,0 +1,7 @@
+# The repo had no root .gitignore until 2026-09-08, and a run of the Python tests under
+# scripts/ committed a .pyc for it: `python3 scripts/test_*.py` writes scripts/__pycache__/,
+# and the next `git add -A` takes it. Build output of a specific interpreter version, in a
+# repo every org vendors from, is noise a reviewer has to read past — and a stale one is
+# worse than noise, because Python will load it over a source file whose mtime it doubts.
+__pycache__/
+*.pyc

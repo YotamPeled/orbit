@@ -1,0 +1,260 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# Loki, monolithic, on the Hetzner bucket — every value below that differs from the
+# chart's defaults is a recorded decision in orbit-core docs/OBSERVABILITY.md §3:
+# the defaults are sized for a fleet and would either refuse to schedule (11 GiB of
+# memcached) or keep data forever (retention off).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: loki
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  project: default
+  source:
+    # The community chart: grafana/loki in the grafana repo is Enterprise Logs now.
+    repoURL: https://grafana-community.github.io/helm-charts
+    chart: loki
+    targetRevision: 18.11.3
+    helm:
+      valuesObject:
+        deploymentMode: SingleBinary
+        loki:
+          auth_enabled: false          # single-tenant; spares X-Scope-OrgID everywhere
+          # At info, Loki logs the full text of every query it runs into its own logs —
+          # which Alloy ships back into Loki. A search for a value is then stored as a log
+          # line: §6.7's first secret scan wrote pieces of every credential into the log
+          # store this way (docs/V1.md §8). warn keeps Loki's errors and drops the query log.
+          server:
+            log_level: warn
+          commonConfig:
+            replication_factor: 1
+          storage:
+            type: s3
+            # The chart demands all three names even in SingleBinary mode where the
+            # ruler and admin stores are unused; one bucket serves all three.
+            bucketNames:
+              chunks: {{objectStorage.buckets.platform}}
+              ruler: {{objectStorage.buckets.platform}}
+              admin: {{objectStorage.buckets.platform}}
+            s3:
+              endpoint: {{objectStorage.endpoint}}
+              # Derived from objectStorage.endpoint by instance-init — the region is the
+              # first label of the S3 host, so the config file carries one endpoint
+              # spelling instead of two that can drift.
+              region: {{objectStorage.region}}
+              secretAccessKey: ${S3_SECRET_KEY}
+              accessKeyId: ${S3_ACCESS_KEY}
+              s3ForcePathStyle: true
+          schemaConfig:
+            configs:
+              # Predates every log line on the node: Alloy replays existing container
+              # logs from file start, and a line older than `from` 500s its whole batch.
+              - from: "2026-01-01"
+                store: tsdb
+                object_store: s3
+                schema: v13
+                index: {prefix: index_, period: 24h}
+          # The real disk guard is the ingestion product, not a PVC: bound =
+          # rate × retention ÷ compression. Every raise is deliberate and re-bounds the
+          # ceiling.
+          #
+          # ingestion_rate_mb is 4, not the 0.5 a fresh orbit's volume suggests, because
+          # the binding constraint is not daily load: every Alloy restart or reposition
+          # REPLAYS container logs from file start, and that catch-up burst measured a
+          # 1-minute peak of ~2.0 MB/s offered — 4x a 0.5 MB/s valve — while dropping
+          # lines with discard reason `rate_limited` (HTTP 429, "limit: 524288
+          # bytes/sec"). The binding limit is the per-TENANT ingestion_rate_mb, NOT
+          # per_stream_rate_limit (which reports its own reason and keeps its generous
+          # 3 MB/s default), so only the tenant valve is raised. Burst 8 MB (2x the rate)
+          # absorbs a replay backlog delivered in one push. Steady-state real volume is
+          # ~0.05-0.2 MB/s, a rounding error — the valve exists to swallow the replay
+          # spike.
+          #
+          # retention_period is 14d, matching Prometheus's retention, so a metric or a
+          # trace that outlives an incident still links to the log line that explains it.
+          # The coherence floor is the longest alert detection window plus its
+          # repeat_interval; 24h deleted the logs covering a failure BEFORE the alert that
+          # detects it could fire. Re-bounds the disk ceiling to 4 MB/s x 14d / ~10x
+          # compression ~= 480 GB compressed — a CEILING only reached if the valve were
+          # pinned at max forever.
+          limits_config:
+            retention_period: 14d
+            ingestion_rate_mb: 4
+            ingestion_burst_size_mb: 8
+            allow_structured_metadata: true
+            volume_enabled: true
+            discover_log_levels: true
+            max_query_parallelism: 4
+          compactor:
+            retention_enabled: true    # default is OFF and keep-forever
+            delete_request_store: s3
+          pattern_ingester:
+            enabled: true              # Logs Drilldown is dead without it
+          querier:
+            max_concurrent: 4
+          # The ruler, wired — this block IS the truth of `lokiRuler: wired` in
+          # instance/config.yaml, and the generator refuses a `logs` trigger without that
+          # declaration. A stock SingleBinary Loki ships a ruler that loads nothing and
+          # notifies no one: rule storage defaults to the S3 object store and there is no
+          # alertmanager_url, so a rule that somehow fired would fire into the void.
+          #
+          # LOCAL store, not the S3 prefix. Rule bodies are generated from
+          # catalog/projects.yaml by `make sync`, so their source of truth is the instance
+          # repo and their delivery should be the one every other generated manifest uses:
+          # Argo applies a ConfigMap, the kubelet projects it into the pod. An S3 prefix
+          # would put the rules outside git — uploaded out of band, invisible to
+          # `make check`, drifting the moment someone edits the bucket.
+          #
+          # NOT the chart's rules sidecar, which is the other way to get files into
+          # /etc/loki/rules and is deliberately OFF below. The explicit mount is strictly
+          # better provenance AND strictly better security: it pins the exact ConfigMap
+          # name and namespace, so a rule file can only arrive from the one object the
+          # generator writes.
+          #
+          # `directory` is the store ROOT; the ruler reads rule files from a per-tenant
+          # subdirectory under it. auth_enabled is false above, so Loki's single tenant is
+          # literally named `fake` — hence the mount lands on /etc/loki/rules/fake. Rule
+          # updates need NO pod restart: the kubelet refreshes a projected ConfigMap within
+          # ~1-2 minutes and the ruler re-polls its local store every minute. The wal dir
+          # is the chart default, written out explicitly because setting `rulerConfig` at
+          # all replaces the whole block.
+          rulerConfig:
+            wal:
+              dir: /var/loki/ruler-wal
+            storage:
+              type: local
+              local:
+                directory: /etc/loki/rules
+            alertmanager_url: http://kube-prometheus-stack-alertmanager.monitoring.svc.cluster.local:9093
+        singleBinary:
+          replicas: 1
+          # The pod-spec half of the no-token change; see the rbac/sidecar block below for
+          # why both halves are needed. Set here rather than on defaults.* so it lands on
+          # the one workload this deployment actually runs.
+          automountServiceAccountToken: false
+          resources:
+            # Measured 48h: peak 187Mi, p99 186Mi — 768Mi reserved 4.1x the peak. The
+            # LIMIT deliberately stays 768Mi: Loki is the same shape as Tempo, where a
+            # compactor/flush burst is invisible in a steady-state sample and the process
+            # was SIGKILLed by exactly that. Burst room belongs in the limit, which is what
+            # the kernel kills on, not in the reservation, which only schedules.
+            # 384Mi rather than the peak+30% rule's 256Mi: that window measured a
+            # 24h-retention corpus and retention is 14d above, so the index/cache working
+            # set grows across the coming fortnight. Cheap insurance on a number that only
+            # sets eviction rank.
+            requests: {cpu: 100m, memory: 384Mi}
+            limits: {memory: 768Mi}
+          extraEnv:
+            # Loki does not self-set GOMEMLIMIT; the 4 GB RSS horror stories are
+            # unbounded query parallelism meeting an unbounded heap.
+            - {name: GOMEMLIMIT, value: 640MiB}
+            - name: S3_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: orbit-s3, key: access-key}}
+            - name: S3_SECRET_KEY
+              valueFrom: {secretKeyRef: {name: orbit-s3, key: secret-key}}
+          extraArgs: ["-config.expand-env=true"]
+          # The rule files: two generators' ConfigMaps, projected side by side onto the
+          # ruler's tenant directory. `orbit-agents-logs-triggers` is rendered by
+          # scripts/catalog-sync.py from every `logs` trigger in catalog/projects.yaml;
+          # `orbit-monitors-logs` is rendered by orbitd from every log monitor in
+          # monitors/*.yaml. Their data keys do NOT collide — the agent generator
+          # writes `orbit-agents-logs.yaml`, orbitd writes `rules.yaml` — so the
+          # projection never shadows one rule set with the other.
+          #
+          # `optional: true` is LOAD-BEARING, not defensive habit. Both ConfigMaps
+          # belong to generated apps: an instance with no `logs` trigger never renders
+          # the agent one, pruning the plane deletes it, and an instance with no log
+          # monitors never renders the monitors one. A required source for an absent
+          # ConfigMap wedges the pod in ContainerCreating forever — so removing the
+          # last logs trigger would take the whole LOG STORE down as collateral. With
+          # `optional` the missing side is simply absent and the ruler evaluates the
+          # other, which is the correct meaning of "nothing of that kind declared".
+          extraVolumes:
+            - name: agent-logs-rules
+              projected:
+                sources:
+                  - configMap:
+                      name: orbit-agents-logs-triggers
+                      optional: true
+                  - configMap:
+                      name: orbit-monitors-logs
+                      optional: true
+          extraVolumeMounts:
+            - name: agent-logs-rules
+              mountPath: /etc/loki/rules/fake
+              readOnly: true
+        # The memberlist headless Service must publish the pod's DNS record BEFORE the pod
+        # is Ready. SingleBinary Loki has a startup DNS race: on boot the ingester resolves
+        # loki-memberlist.loki.svc to join the ring, but the kubelet only adds the pod to
+        # that headless Service's Endpoints once it passes readiness — so a cold boot hits
+        # "no such host", the ingester falls back to registering the ring under a FOREIGN
+        # identity (the node's hostname@node-ip instead of loki-0@pod-ip), and its S3 store
+        # client then returns 100% HTTP 500: writes are accepted but never reach the
+        # queryable store — chunks orphaned, index unwritten, queries empty. Publishing
+        # not-ready addresses lets the pod resolve its own memberlist record on boot.
+        memberlist:
+          service:
+            publishNotReadyAddresses: true
+        # SingleBinary does not zero the scalable targets for you; the chart's
+        # validator refuses replicas on both.
+        write: {replicas: 0}
+        read: {replicas: 0}
+        backend: {replicas: 0}
+        # The bundled caches request ~11 GiB combined. The embedded cache is bounded
+        # by Loki's own cgroup and is enough at this volume.
+        chunksCache: {enabled: false}
+        resultsCache: {enabled: false}
+        gateway: {enabled: false}      # direct service; one less pod
+        lokiCanary: {enabled: false}
+        test: {enabled: false}
+        # The rules sidecar, and the cluster-wide Secret grant it drags in. The chart
+        # defaults sidecar.rules.enabled=true, which puts a kiwigrid/k8s-sidecar next to
+        # Loki watching for configmaps and secrets labelled loki_rule — and to pay for it
+        # templates/backend/clusterrole.yaml emits a ClusterRole granting the loki SA
+        # get/watch/list on ALL configmaps and secrets, CLUSTER-WIDE, with no
+        # resourceNames.
+        #
+        # The grant is not even what the sidecar asks for. kiwigrid defaults NAMESPACE to
+        # its own pod namespace and the chart does not set NAMESPACE=ALL, so the sidecar
+        # only ever reads the loki namespace. The chart hands out a cluster-wide read on
+        # every Secret in the platform to satisfy a workload whose own reads never leave
+        # its namespace. What that buys an attacker: the sops age PRIVATE key behind every
+        # SOPS secret, the recovery masterkey, the IdP masterkey and ESO's Infisical
+        # machine identity — the shortest path from a log-store compromise to every secret
+        # the platform holds.
+        #
+        # Turning the sidecar off empties the ClusterRole's rules; rbac.namespaced=true
+        # additionally stops the ClusterRole and ClusterRoleBinding being rendered at all,
+        # and with the sidecar off the namespaced Role/RoleBinding are not rendered either
+        # (templates/role.yaml needs `namespaced AND sidecar.rules.enabled`). End state:
+        # the loki SA holds no Role, RoleBinding, ClusterRole or ClusterRoleBinding
+        # anywhere — it cannot read a Secret in its OWN namespace.
+        #
+        # Loki never talks to the API server (no kubernetes SD in its config; memberlist
+        # joins by DNS, storage is S3, the S3 keys arrive as env from a secretKeyRef the
+        # kubelet resolves), so nothing in the pod has any use for a token — hence
+        # automountServiceAccountToken: false, which has to be set in BOTH places, because
+        # defaults.automountServiceAccountToken is a literal true and the pod spec beats
+        # the ServiceAccount object.
+        #
+        # The ruler above still gets its rules: they arrive by the explicit mount, which
+        # needs no RBAC at all. This door stays shut.
+        rbac:
+          namespaced: true
+        sidecar:
+          rules: {enabled: false}
+        serviceAccount:
+          automountServiceAccountToken: false
+        monitoring:
+          serviceMonitor: {enabled: true}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: loki
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]

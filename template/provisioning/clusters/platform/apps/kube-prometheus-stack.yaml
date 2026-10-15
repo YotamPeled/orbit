@@ -1,0 +1,718 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# Prometheus, Alertmanager and Grafana — the platform's eyes.
+#
+# One chart rather than three, because the three are not independent: the operator's CRDs
+# are what make `metrics:` in the service chart mean anything, Grafana's datasource is
+# provisioned from the Prometheus it ships beside, and Alertmanager is wired to that same
+# Prometheus by the operator rather than by a config file someone has to keep in step.
+#
+# Wave 3, not -1 with the other operators. Grafana's admin credential is a SopsSecret
+# applied by the desk in wave 2, and Argo will not begin a wave until the previous
+# one is healthy — so a consumer placed BEFORE its producer does not race, it deadlocks.
+# Still comfortably ahead of `services` (wave 5), which is the constraint that actually
+# matters: a service declaring `metrics:` renders a ServiceMonitor, and that CRD arrives
+# with this chart.
+#
+# ServerSideApply for the same reason as ESO and CNPG: the Prometheus CRD alone is far past
+# the 262144-byte last-applied-configuration annotation limit.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  project: default
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    targetRevision: 88.2.0
+    helm:
+      values: |
+        # ── what this cluster does not have ──────────────────────────────────────
+        # k3s runs the control plane as one process and does not expose the
+        # component metrics ports these scrape. Left enabled they become targets
+        # that are permanently down, and their alert rules fire forever — which
+        # trains you to ignore the alert channel, the single most expensive thing
+        # that can happen to a monitoring system.
+        kubeControllerManager: {enabled: false}
+        kubeScheduler: {enabled: false}
+        kubeProxy: {enabled: false}
+        kubeEtcd: {enabled: false}
+        # The node registers two InternalIPs — Hetzner hands out a /64 — and the operator
+        # builds the kubelet Endpoints from every one of them. The cluster network is
+        # IPv4-only, so the IPv6 half of each scrape is "network is unreachable" forever:
+        # exactly half the kubelet targets down, TargetDown and KubeletInstanceUnreachable
+        # firing permanently on a completely healthy node.
+        #
+        # Dropped by relabeling rather than by taking IPv6 off the node, which would mean
+        # restarting k3s under live services to fix a monitoring artefact. The single rule
+        # each list already carried is repeated here because setting a relabeling list
+        # REPLACES the chart's default rather than appending to it — omit it and the
+        # metrics_path label silently disappears from every kubelet series.
+        kubelet:
+          serviceMonitor:
+            relabelings: &dropIPv6
+              - {action: replace, sourceLabels: [__metrics_path__], targetLabel: metrics_path}
+              - {action: drop, sourceLabels: [__address__], regex: '\[.+\]:.*'}
+            cAdvisorRelabelings: *dropIPv6
+            probesRelabelings: *dropIPv6
+            resourceRelabelings: *dropIPv6
+            # Series diet, MEASURED 2026-09-10: Prometheus held 188k head series and
+            # 89k of them came from this /metrics endpoint. On k3s the kubelet, API
+            # server and etcd are one process, so /metrics re-exports every
+            # API-server and etcd histogram the apiserver job already scrapes —
+            # those families are dropped here as duplicates. What stays is the
+            # kubelet's own: the running-pods, pleg, volume, storage, rest-client
+            # and process families the default rules and dashboards read. cAdvisor
+            # is untouched by this rule (a separate scrape), so the memory and OOM
+            # series the budget alert joins on survive.
+            # The first rule below is the chart's own default for this job, carried
+            # forward verbatim: setting metricRelabelings REPLACES the default
+            # rather than appending to it (same as the target relabelings above),
+            # and without it the storage-operation buckets the default drops come
+            # back on top of the diet. The diet's own drop follows it: one rule,
+            # one alternation.
+            metricRelabelings:
+              - action: drop
+                regex: (csi_operations|storage_operation_duration)_seconds_bucket;(0.25|2.5|15|25|120|600)(\.0)?
+                sourceLabels:
+                  - __name__
+                  - le
+              # Round two, MEASURED 2026-09-12 (evidence/phase8-after/series-by-job.md):
+              # the scheduler, kine (k3s's etcd shim), CRD openapi and feature-gate
+              # families and the rest-client size histograms are re-exports or unread,
+              # 2k series in one alternation.
+              - {action: drop, sourceLabels: [__name__], regex: 'apiserver_.*|etcd_.*|workqueue_.*|scheduler_.*|kine_.*|apiextensions_.*|kubernetes_feature_enabled|rest_client_(request|response)_size_bytes_.*'}
+            # The probes endpoint (/metrics/probes) is its own scrape with its own list
+            # (the chart ships none for it): the prober duration histogram, 800 series,
+            # is unread; the readiness rule reads prober_probe_total, which stays.
+            probesMetricRelabelings:
+              - {action: drop, sourceLabels: [__name__], regex: 'prober_probe_duration_seconds_.*'}
+        # The apiserver job. Round one dropped the size and watch histograms and
+        # left 40k series (MEASURED 2026-09-12, evidence/phase8-after/series-by-job.md:
+        # 54% of the head), nearly all of it the request, SLI and etcd duration
+        # histograms and the workqueue and scheduler families. The only rules
+        # reading those were the chart's four API-server SLO rule groups
+        # (availability, burn rate, histogram quantiles, error-budget alert --
+        # rendered from 88.2.0 and grepped, 2026-09-12), which are turned off under
+        # defaultRules below. What is given up with them: the burn-rate warning
+        # that API latency or sustained errors are degrading while the process
+        # stays up, and the SLO panels of the chart's stock apiserver dashboard
+        # (the acceptance counts the generated dashboards, not the stock ones).
+        # Taken because the groups compute a 30-day availability for a control
+        # plane meant to run replicated; on one k3s node the API server is the
+        # kubelet's process, whose death every other alert reports, and the
+        # remaining group still alerts on terminated requests and aggregated-API
+        # errors.
+        #
+        # So this job keeps an allow-list rather than a drop-list: what the rule
+        # groups that stay on read (kubernetes-system-apiserver: the client
+        # certificate expiry histogram, request terminations, the request counter,
+        # the aggregated-API gauges; kubernetes-system: the API server's own
+        # rest-client counter, which KubeClientErrors selects on this job -- review
+        # r99b) plus up and the process family every target carries. One rule; a
+        # family not named here is not scraped. The chart's default bucket-drop
+        # rule is no longer carried because no bucket it named survives the
+        # allow-list.
+        kubeApiServer:
+          serviceMonitor:
+            metricRelabelings:
+              - {action: keep, sourceLabels: [__name__], regex: 'up|scrape_.*|apiserver_request_total|apiserver_request_terminations_total|apiserver_client_certificate_expiration_seconds_.*|aggregator_unavailable_apiservice.*|rest_client_requests_total|process_.*|go_goroutines'}
+
+        defaultRules:
+          create: true
+          # Two rules, not the group they live in. KubeCPUQuotaOvercommit compares the SUM
+          # of every namespace's hard quota against the node's allocatable capacity and
+          # fires above 1.5x — which assumes a quota is a capacity reservation. Here it is
+          # not: the generator gives every project a deliberately generous ceiling as a
+          # runaway guard, so one service cannot schedule fifty pods, and nothing comes
+          # close to requesting it. Six namespaces on an 8-core box crossed the line the
+          # moment a tenant grew a dev environment; one more project would have done it
+          # anyway, and the memory sibling is two projects behind.
+          #
+          # Disabled rather than answered by shrinking the quotas: shrinking a backstop to
+          # satisfy an alert that misreads its purpose turns it into a budget nobody chose.
+          # Named individually so the rest of the group survives — KubeQuotaExceeded (a pod
+          # the quota actually refused) and CPUThrottlingHigh are exactly the signals that
+          # would tell us this judgement was wrong.
+          disabled:
+            KubeCPUQuotaOvercommit: true
+            KubeMemoryQuotaOvercommit: true
+          rules:
+            etcd: false
+            # The four API-server SLO groups, off with the histograms they read
+            # (the apiserver allow-list above): kube-apiserver-availability.rules,
+            # kube-apiserver-burnrate.rules, kube-apiserver-histogram.rules and the
+            # kube-apiserver-slos alert. What stays for the API server is the
+            # kubernetes-system-apiserver group: KubeAPIDown, terminated requests,
+            # aggregated-API errors and the client certificate expiry.
+            kubeApiserverAvailability: false
+            kubeApiserverBurnrate: false
+            kubeApiserverHistogram: false
+            kubeApiserverSlos: false
+            kubeProxy: false
+            kubeSchedulerAlerting: false
+            kubeSchedulerRecording: false
+            kubeControllerManager: false
+            kubernetesSystemControllerManager: false
+            kubernetesSystemScheduler: false
+            windows: false
+
+        # ── the operator ─────────────────────────────────────────────────────────
+        prometheusOperator:
+          priorityClassName: orbit-platform
+          resources:
+            # Measured 48h: peak 41Mi, p99 37Mi. A 192Mi request reserved 4.7x the peak.
+            # Request tracks the measurement; the limit stays 192Mi so nothing about the
+            # kill ceiling changes. That split holds for every block in this file.
+            requests: {cpu: 10m, memory: 64Mi}
+            limits: {memory: 192Mi}
+          admissionWebhooks:
+            # cert-manager issues the webhook's certificate instead of the chart's
+            # pre/post-install patch Jobs. Those Jobs are Helm hooks, and Argo's
+            # handling of hooks has already cost this project a silently-skipped
+            # Sync hook and a deadlocked PostSync one. cert-manager is a platform
+            # component already; using it removes the hooks entirely.
+            certManager: {enabled: true}
+
+        # ── Prometheus ───────────────────────────────────────────────────────────
+        prometheus:
+          prometheusSpec:
+            replicas: 1
+            # 7d, down from 14d: half the window, roughly half the disk.
+            # retentionSize below stays as the second bound.
+            retention: 7d
+            # A second bound, in bytes. Retention by time alone is a promise about
+            # age, not about disk: a burst of new series fills the volume long
+            # before 7 days elapse, and a full volume is how a Prometheus stops
+            # recording the incident it exists to record.
+            retentionSize: 10GiB
+            scrapeInterval: 30s
+            evaluationInterval: 30s
+            priorityClassName: orbit-platform
+            resources:
+              # 768Mi request / 1536Mi limit, MEASURED 2026-09-10: 188k head series
+              # held a 1036Mi working set. The diet above (kubelet duplicates and
+              # unread apiserver histograms dropped) plus 7d retention is expected
+              # to hold the steady state under the request; the old 2Gi reserved
+              # twice what the box ever saw resident. The limit stays 2x the request so a
+              # compaction spike has room before the SIGKILL — a limit at the
+              # request would OOM on exactly the incident Prometheus exists to
+              # record. Re-raise only on a measured ceiling, never preemptively.
+              requests: {cpu: 100m, memory: 768Mi}
+              limits: {memory: 1536Mi}
+            # Diet three (measured 2026-09-12, after diets one and two): the head fell
+            # to 27k series and the working set stayed at 720 MiB, because the series
+            # no longer set the heap -- the collector's target did. Two scrapes (the
+            # kubelet's /metrics and the API server, one k3s registry served twice)
+            # deliver 93k samples each per cycle that the allow-lists then drop, and
+            # what is parsed and dropped is garbage the collector lets pile up to
+            # 75% over the live heap before it runs (Prometheus's default). 30% over
+            # is the trade here: the collector runs about twice as often on a process
+            # averaging a sixth of a core, and the working set follows the live heap
+            # instead of the parse volume. The soft limit at half the container limit
+            # (the request) makes the runtime give freed pages back promptly; it is
+            # soft: a compaction spike above it costs collector time, not a refusal.
+            # The kill line is still the container limit above, untouched.
+            runtime:
+              goGC: 30
+            additionalArgs:
+              - name: auto-gomemlimit.ratio
+                value: "0.5"
+            # ONLY the remote-write receiver, for Tempo's span metrics. The OTLP
+            # receiver stays off (Decision 5): two ingest paths make `job` mean two
+            # different things in one Prometheus.
+            enableRemoteWriteReceiver: true
+            # Exemplars from Tempo's span metrics are what the Grafana metrics -> trace
+            # link follows (exemplarTraceIdDestinations below); without the feature they
+            # are dropped on arrival and the link never resolves (docs/V1.md §6.1).
+            enableFeatures: [exemplar-storage]
+            exemplars:
+              maxSize: 100000
+            # The chart's default selectors match only objects carrying its own
+            # release label, which would silently exclude every ServiceMonitor and
+            # PrometheusRule this platform generates. Nil-selector means "watch
+            # everything in the cluster" — correct here, where the cluster is one
+            # box and everything on it is ours.
+            serviceMonitorSelectorNilUsesHelmValues: false
+            podMonitorSelectorNilUsesHelmValues: false
+            ruleSelectorNilUsesHelmValues: false
+            probeSelectorNilUsesHelmValues: false
+            scrapeConfigSelectorNilUsesHelmValues: false
+            storageSpec:
+              volumeClaimTemplate:
+                spec:
+                  storageClassName: local-path
+                  accessModes: [ReadWriteOnce]
+                  resources:
+                    requests: {storage: 15Gi}
+
+        # ── Alertmanager ─────────────────────────────────────────────────────────
+        alertmanager:
+          # The config below is used verbatim. Helm templating over it is off,
+          # because the config is FULL of Go template syntax that belongs to
+          # Alertmanager — `{{ .Status }}`, `{{ range .Alerts }}` — and Helm would
+          # evaluate it at render time and emit an empty message.
+          tplConfig: false
+          config:
+            # ── inhibition, and the agent plane's exemption from it ────────────
+            # FOUND LIVE (2026-08-29). These four rules are the chart's own
+            # defaults, repeated here for one reason: a metric trigger declared
+            # `severity: info` was matched by the OrbitAgent* route below, and
+            # then held state=suppressed by the stock InfoInhibitor rule. It was
+            # never delivered to the intake, never 404'd, and never touched
+            # Alertmanager's notification-failure counter — the plane's own
+            # safety net cannot see an alert that is suppressed BEFORE the
+            # notification pipeline. The agent simply never ran.
+            #
+            # Inhibition is a HUMAN concern: it exists so a person is not paged
+            # about a symptom while its cause is already on the screen. The
+            # derived OrbitAgent* space is not a notification channel — it is a
+            # machine work queue, and a work item is not noise because another
+            # alert is louder. So the derived space is exempted, by adding
+            # `alertname !~ "^OrbitAgent.*"` to the TARGET side of every stock
+            # rule that could suppress one. Source sides are untouched: each rule
+            # equals on `alertname`, so a derived alert can only ever inhibit
+            # another alert of the same name — human-facing behaviour is
+            # unchanged, and nothing here is weakened for platform alerts.
+            #
+            # A whole list, not an append: a values list REPLACES the chart's
+            # default rather than merging with it (the same rule the kubelet
+            # relabelings above are spelled out for). Drift from the chart's
+            # defaults on a version bump is therefore possible and deliberate —
+            # scripts/verify/am-routes.py simulates these rules against the
+            # derived space, so the exemption is asserted rather than assumed.
+            inhibit_rules:
+              - source_matchers: ['severity = critical']
+                target_matchers: ['severity =~ warning|info',
+                                  'alertname !~ "^OrbitAgent.*"']
+                equal: [namespace, alertname]
+              - source_matchers: ['severity = warning']
+                target_matchers: ['severity = info',
+                                  'alertname !~ "^OrbitAgent.*"']
+                equal: [namespace, alertname]
+              # THE one that fired live: InfoInhibitor is a permanently-firing
+              # synthetic alert, so its target side suppresses every info alert
+              # in the namespace unconditionally.
+              - source_matchers: ['alertname = InfoInhibitor']
+                target_matchers: ['severity = info',
+                                  'alertname !~ "^OrbitAgent.*"']
+                equal: [namespace]
+              # Stock, and left exactly as it ships: its target is InfoInhibitor
+              # itself, which no derived alert can ever be, so the exemption
+              # would be a no-op here and pretending otherwise would suggest this
+              # rule was ever in the way.
+              - target_matchers: ['alertname = InfoInhibitor']
+            route:
+              # Group by the alert and where it happened, so one flapping pod does
+              # not arrive as fifty separate messages.
+              group_by: [alertname, namespace]
+              group_wait: 30s
+              group_interval: 5m
+              repeat_interval: 12h
+              receiver: telegram
+              routes:
+                # Watchdog is a synthetic alert that fires permanently and on
+                # purpose: its ABSENCE is the signal that the alerting path itself
+                # is dead. It must never reach a human channel.
+                - matchers: [alertname = "Watchdog"]
+                  receiver: "null"
+                # The agent plane's wiring, and the whole of it. EVERY alertname a
+                # metric/logs trigger derives is `OrbitAgent<Agent><Trigger>`
+                # (catalog-sync.py), so ONE regex route carries every trigger that
+                # exists today and every trigger anyone declares later — no
+                # per-trigger Alertmanager edit, ever. Terminal (no `continue`): a
+                # generated alert goes to the intake and NOT to Telegram, because it
+                # is an agent's work item, not a page for a human.
+                #
+                # Placement is load-bearing: BELOW the Watchdog null-route (first
+                # match wins) and above nothing else, so the fall-through to the human
+                # receiver stays the default for every alert that is not the plane's.
+                #
+                # An alertname in this space that the intake has no route for is a 404
+                # — deliberately. It lands in Alertmanager's
+                # `alertmanager_notifications_failed_total`, which is the designed
+                # safety net: an alert nobody routes is visible, rather than silently
+                # paging a human with an agent's work item.
+                - matchers: ['alertname =~ "^OrbitAgent.*"']
+                  receiver: orbit-intake
+                # Monitors (orbitd-rendered PrometheusRules and Probes, one alert
+                # per monitor) are split from BOTH of the above by label, not by
+                # name. Every monitor alert carries `orbit_monitor` (the monitor's
+                # name) and `orbit_notify` (`telegram` or `none`); platform alerts
+                # carry neither, and agent-plane alerts carry neither either, so
+                # these routes sit BELOW the Watchdog and OrbitAgent routes and only
+                # fire on what fell through both. Each stage narrows by one EXACT
+                # matcher, never a regex: a regex here is evaluated on every alert
+                # (the catalog-sync.py note on generated matchers), and there is
+                # nothing to pattern-match — only presence and two fixed values.
+                #
+                # The orbitd route carries `continue`: orbitd records the transition
+                # (firing AND resolved) for monitor_status REGARDLESS of whether a
+                # human is paged, so the alert always continues past it to the human
+                # decision below. A `none` monitor needs no third route to stay
+                # silent: the orbitd route already matched, so the root's telegram
+                # receiver never applies (a parent receiver is used only when NO
+                # child matched) and the alert ends at orbitd alone. A `null` route
+                # here would notify a receiver with no configs — a no-op in
+                # production that only lengthens the delivery list.
+                - matchers: ['orbit_monitor != ""']
+                  receiver: orbitd
+                  continue: true
+                # A monitor its owner wants paged joins the normal human channel;
+                # anything else monitor-shaped ends at orbitd above and never pages.
+                - matchers: ['orbit_notify = "telegram"']
+                  receiver: telegram
+            receivers:
+              - name: "null"
+              # Findings (the webhook receiver that recorded alerts durably) was
+              # removed from the catalog 2026-08-25. When the agent plane lands
+              # (Phase D), its notifier re-joins HERE, on this same receiver — one
+              # receiver holding both notifiers, never a second route, so the human
+              # and the agent can never be told different things.
+              # The receiver keeps its name whether or not the alerts-telegram feature is
+              # on: it is the route's default, "the human channel". With the feature off
+              # it carries the delivery record below and nothing else — alerts are
+              # raised and recorded, and nobody is messaged.
+              - name: telegram
+                # orbit:feature alerts-telegram
+                telegram_configs:
+                  - bot_token_file: /etc/alertmanager/secrets/alertmanager-telegram/bot-token
+                    chat_id: {{contacts.telegramChatId}}
+                    send_resolved: true
+                    # Deliberately plain text, not HTML or Markdown. An alert
+                    # description containing a stray `<` or `_` makes Telegram
+                    # reject the whole message with a 400, so a formatted channel
+                    # drops exactly the alerts whose text is most unusual.
+                    parse_mode: ""
+                    message: |-
+                      {{ if eq .Status "firing" }}FIRING{{ else }}RESOLVED{{ end }} [{{ .Alerts | len }}] {{ .CommonLabels.alertname }}
+                      {{ range .Alerts }}
+                      {{ .Labels.namespace }}/{{ .Labels.pod }}{{ .Labels.instance }}
+                      {{ .Annotations.summary }}
+                      {{ .Annotations.description }}
+                      {{ end }}
+                # orbit:end alerts-telegram
+                # The delivery record (docs/V1.md §6.3): every notification this human
+                # receiver sends is also POSTed to the alert-recorder
+                # (provisioning: clusters/platform/config/monitoring/alert-recorder.yaml), which logs
+                # one line per alert (labels only) for a test to find in Loki. A second
+                # integration on the SAME receiver, not a second route: routing — who is
+                # paged — is untouched, and the record is exactly what reached a human.
+                webhook_configs:
+                  - url: http://alert-recorder.monitoring.svc:8080/
+                    send_resolved: true
+              # The agent plane's event router. Alertmanager POSTs the matched alert
+              # here; the intake authenticates the bearer, matches the labels against
+              # its generated routing config and dispatches to the agent that declared
+              # the trigger. The Service exists only once some agent declares
+              # `triggers:` — until then this receiver is named by a route that never
+              # matches, which costs nothing.
+              #
+              # The bearer is read from a FILE, never inlined: Alertmanager's config is
+              # rendered by the chart into a Secret that appears verbatim in Argo's
+              # diff view. It is mounted by alertmanagerSpec.secrets below from the
+              # `alertmanager-intake` SopsSecret the desk applies from
+              # clusters/platform/secrets/monitoring/alertmanager-intake.yaml, whose
+              # value is the same sealed key the intake itself verifies —
+              # INTAKE_ALERTMANAGER_TOKEN.
+              #
+              # send_resolved: false. The intake's generated routes match
+              # `status: firing`, so a resolved POST would be an unrouted 404 that
+              # false-trips the intake's own dispatch-failure alert.
+              - name: orbit-intake
+                webhook_configs:
+                  - url: http://orbit-agents-intake.orbit-agents-prod.svc/webhook/alertmanager
+                    send_resolved: false
+                    http_config:
+                      authorization:
+                        type: Bearer
+                        credentials_file: /etc/alertmanager/secrets/alertmanager-intake/token
+              # Monitor transitions, recorded by orbitd. Alertmanager POSTs every
+              # firing AND resolved monitor alert here — send_resolved: true, because
+              # the resolved POST is what flips monitor_status back to healthy. (The
+              # intake above is false for the opposite reason: its generated routes
+              # match `status: firing`, so a resolved POST would be an unrouted 404.)
+              #
+              # The Bearer [REDACTED] read from a FILE, never inlined, for the same reason
+              # as the intake above: the rendered config Secret appears verbatim in
+              # Argo's diff view. Mounted by alertmanagerSpec.secrets below from the
+              # `orbit-alert-webhook` Secret, whose value is the same key orbitd
+              # itself verifies (ORBITD_ALERT_WEBHOOK_TOKEN_FILE). The Secret itself
+              # is provisioned by a later change in both namespaces — until then
+              # this receiver's POSTs answer 401, which is a visible failure, not a
+              # silent drop.
+              - name: orbitd
+                webhook_configs:
+                  - url: http://orbitd.orbit.svc.cluster.local/v1/alertmanager
+                    send_resolved: true
+                    http_config:
+                      authorization:
+                        type: Bearer
+                        credentials_file: /etc/alertmanager/secrets/orbit-alert-webhook/token
+          alertmanagerSpec:
+            replicas: 1
+            priorityClassName: orbit-platform
+            # Mounted at /etc/alertmanager/secrets/<name>/<key>. The bot token is
+            # read from that path by the config above; it is never rendered into
+            # the config Secret, which Argo displays in plain text on every diff.
+            secrets:
+              # orbit:feature alerts-telegram
+              - alertmanager-telegram
+              # orbit:end alerts-telegram
+              - alertmanager-intake
+              - orbit-alert-webhook
+            resources:
+              # Measured 48h: peak 38Mi, p99 34Mi — was 3.4x over-reserved.
+              requests: {cpu: 10m, memory: 64Mi}
+              limits: {memory: 128Mi}
+            storage:
+              volumeClaimTemplate:
+                spec:
+                  storageClassName: local-path
+                  accessModes: [ReadWriteOnce]
+                  resources:
+                    requests: {storage: 2Gi}
+
+        # ── Grafana ──────────────────────────────────────────────────────────────
+        grafana:
+          # The dashboards feature (provisioning/features.yaml): off, the chart renders
+          # no Grafana at all, and everything below this line is read by nothing.
+          enabled: {{features.dashboards}}
+          priorityClassName: orbit-platform
+          # Grafana carries its own login rather than sitting behind Traefik
+          # basic-auth: it needs a real user identity for API tokens and dashboard
+          # ownership, and a basic-auth prompt in front of a login form is two
+          # doors with one key.
+          admin:
+            existingSecret: grafana-admin
+            userKey: admin-user
+            passwordKey: admin-password
+          resources:
+            # 256Mi was a pre-deploy guess and it is UNDER the container's own demand:
+            # exit-137, restartCount climbing, five-plus OOMKills. The working-set
+            # measurement is CENSORED by the limit — the cgroup SIGKILLs at 256Mi, so
+            # container_memory_working_set_bytes can never record the true peak; every
+            # incarnation ramps 169->235->255Mi over ~50m and dies pinned at the ceiling.
+            # Real demand observed out of band is ~335Mi (dashboards + sidecar-provisioned
+            # datasources + the render token path resident together). 512Mi is ~1.5x that
+            # and 2x the censored ceiling — headroom for a workload whose exact peak
+            # cannot be seen. request==limit keeps Guaranteed QoS, the platform
+            # convention. This is the one block here where the LIMIT rises, because here
+            # the limit was the bug.
+            requests: {cpu: 20m, memory: 512Mi}
+            limits: {memory: 512Mi}
+          # The server keeps no copy of anything: dashboards and datasources arrive
+          # through the sidecars from the tree, and the admin sign-in is created from
+          # the sealed Secret at every start. With a persistent database it was not:
+          # Grafana applies the environment's admin password only when it first creates
+          # the admin user, so a rotation through the sealed plane moved the value
+          # everywhere but the one place the server checks it, and the helper containers
+          # were refused (phase-6 acceptance, 2026-09-12). A re-seal plus a restart is a
+          # rotation only while there is no copy to go stale.
+          persistence:
+            enabled: false
+          # Recreate stays: one replica, and a rotation relies on the old server being
+          # gone before the new one creates the admin from the new value.
+          deploymentStrategy: {type: Recreate}
+          defaultDashboardsEnabled: true
+          # Grafana's own /metrics is 3.6k series (its embedded API-server
+          # histograms and a feature-toggle gauge per flag) that no rule,
+          # dashboard or tool reads; its reachability is a platform probe. Off.
+          serviceMonitor:
+            enabled: false
+          # Datasources come from this file, not from a sidecar. Diet three (2026-09-12):
+          # the datasource sidecar was a second Python watcher over every namespace,
+          # 72 MiB resident, and the only thing it ever found was the chart's own
+          # ConfigMap holding these entries. The dashboards sidecar stays: generated
+          # dashboards arrive as ConfigMaps from orbitd and from projects. The chart's
+          # default Prometheus and Alertmanager entries are written out here by hand
+          # with their uids unchanged (prometheus, alertmanager, loki, tempo): every
+          # generated panel and every correlation link below names one of them.
+          datasources:
+            datasources.yaml:
+              apiVersion: 1
+              datasources:
+                - name: Prometheus
+                  type: prometheus
+                  uid: prometheus
+                  access: proxy
+                  url: http://kube-prometheus-stack-prometheus.monitoring:9090/
+                  isDefault: true
+                  jsonData:
+                    httpMethod: POST
+                    timeInterval: 30s
+                    # metrics -> trace, the fourth correlation link: an exemplar's
+                    # trace_id on the default Prometheus datasource becomes a Tempo link.
+                    # orbit:feature traces
+                    exemplarTraceIdDestinations:
+                      - datasourceUid: tempo
+                        name: trace_id
+                    # orbit:end traces
+                - name: Alertmanager
+                  type: alertmanager
+                  uid: alertmanager
+                  access: proxy
+                  url: http://kube-prometheus-stack-alertmanager.monitoring:9093/
+                  jsonData:
+                    handleGrafanaManagedAlerts: false
+                    implementation: prometheus
+                # The four correlation links (Decision 6) live in this block as fixed-uid
+                # jsonData; every failure mode in this domain is a link that silently
+                # doesn't render, so each one has a stage6 check.
+                # orbit:feature logs
+                - name: Loki
+                  type: loki
+                  uid: loki
+                  access: proxy
+                  url: http://loki.loki.svc:3100
+                  jsonData:
+                    maxLines: 1000
+                    # orbit:feature traces
+                    # logs -> trace: a trace_id in a JSON log line becomes a Tempo link.
+                    # SDKs land in Phase 4; the field shape is the contract already.
+                    derivedFields:
+                      - name: TraceID
+                        matcherRegex: '"trace_id":"(\w+)"'
+                        datasourceUid: tempo
+                        url: "$${__value.raw}"
+                    # orbit:end traces
+                # orbit:end logs
+                # orbit:feature traces
+                - name: Tempo
+                  type: tempo
+                  uid: tempo
+                  access: proxy
+                  url: http://tempo.tempo.svc:3200
+                  jsonData:
+                    # orbit:feature logs
+                    # trace -> logs
+                    tracesToLogsV2:
+                      datasourceUid: loki
+                      spanStartTimeShift: "-5m"
+                      spanEndTimeShift: "5m"
+                      filterByTraceID: true
+                    # orbit:end logs
+                    # trace -> metrics
+                    tracesToMetrics:
+                      datasourceUid: prometheus
+                      queries:
+                        - name: Request rate
+                          query: 'sum(rate(traces_spanmetrics_calls_total{$$__tags}[5m]))'
+                    # No serviceMap: the generator no longer emits service-graph
+                    # metrics, so there is nothing for it to read.
+                    nodeGraph:
+                      enabled: true
+                    # orbit:feature logs
+                    lokiSearch:
+                      datasourceUid: loki
+                    # orbit:end logs
+                # orbit:end traces
+          sidecar:
+            # 192Mi, measured rather than guessed: at 64Mi both sidecars were
+            # OOMKilled in a loop while Grafana itself stayed up, so the pod was
+            # Running and simply never learned about a datasource or a dashboard.
+            # They are Python watchers over every namespace, not shell loops.
+            resources:
+              # Measured 48h: peaks 77Mi / 74Mi, p99 76Mi / 73Mi. The REQUEST drops to
+              # 96Mi (peak +25%); the LIMIT stays 192Mi, so the 64Mi OOM loop described
+              # above cannot come back — that failure was a limit, not a reservation.
+              requests: {cpu: 10m, memory: 96Mi}
+              limits: {memory: 192Mi}
+            datasources:
+              enabled: false
+            dashboards:
+              enabled: true
+              label: grafana_dashboard
+              # Any namespace, so a project can ship its own dashboard beside its
+              # own manifests rather than in a central pile.
+              searchNamespace: ALL
+          # Grafana cannot turn a panel into a picture on its own — that is a headless
+          # Chromium in a sidecar service. It exists so a dashboard change can be LOOKED
+          # AT before it is called correct: three panels shipped this week that were
+          # syntactically fine and visually wrong (a cumulative gauge drawn as a flat
+          # line, a message running off the screen, retired series lingering in a
+          # legend), and every one was caught by a human opening the page. Chromium is
+          # the cost of not needing one.
+          imageRenderer:
+            enabled: true
+            replicas: 1
+            priorityClassName: orbit-platform
+            # The shared token both sides of the render path authenticate with, pinned to
+            # a Secret this repo owns (grafana-image-renderer-token, from the sealed file
+            # SopsSecret in clusters/platform/secrets/monitoring). Left unset, the chart mints the token
+            # with randAlphaNum on every render — its `lookup` of the previous Secret is
+            # empty whenever Helm runs without cluster access, which is exactly how Argo
+            # renders — so each re-render deals Grafana and the renderer a fresh value
+            # while neither pod restarts to pick it up. Both stay Ready, both report
+            # healthy, and every render 401s in silence. The key inside the Secret must be
+            # `token`: the chart hardcodes that on both sides and only the Secret's name is
+            # configurable.
+            existingSecret: grafana-image-renderer-token
+            resources:
+              # The sharpest burst workload on the node: measured 48h median 10Mi, p99
+              # 32Mi, peak 374Mi — Chromium sits idle and spends about FIVE MINUTES of
+              # every 48h above 64Mi, all of it inside the handful of renders that
+              # actually happen. The request is a scheduling reservation and belongs on
+              # the steady state (32Mi p99 +30%, rounded up the ladder = 64Mi); the burst
+              # is the LIMIT's job, and the limit is deliberately unchanged at 384Mi,
+              # which still sits above the 374Mi peak. Below that ceiling Chromium is
+              # OOMKilled mid-page and the render returns a blank PNG rather than an
+              # error, which is worse than no renderer at all.
+              requests: {cpu: 10m, memory: 64Mi}
+              limits: {memory: 384Mi}
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 472
+              runAsGroup: 472
+          grafana.ini:
+            server:
+              root_url: https://grafana.{{domains.primary}}
+            analytics:
+              reporting_enabled: false
+              check_for_updates: false
+            # Grafana signs in with its local admin (admin.existingSecret above) and
+            # nothing else: there is no single sign-on to configure here.
+          ingress:
+            enabled: true
+            ingressClassName: traefik
+            hosts: [grafana.{{domains.primary}}]
+            path: /
+            pathType: Prefix
+            # No tls block, for the same reason as Argo CD's own Ingress: an Ingress
+            # may only reference a Secret in its own namespace and the wildcard lives
+            # in traefik. Traefik's default TLSStore serves it.
+
+        # ── exporters ────────────────────────────────────────────────────────────
+        kube-state-metrics:
+          priorityClassName: orbit-platform
+          # The tenant label on namespaces, which the platform memory-budget
+          # alert joins on to exclude tenant namespaces. kube-state-metrics
+          # exports no namespace labels by default; without this entry the
+          # join matches nothing and the alert counts tenants as platform.
+          # orbit.local/env rides along (one more label on the same series,
+          # no new series): OrbitWorkloadMemoryAtLimit names the project and
+          # the environment of the workload from this join.
+          metricLabelsAllowlist:
+            - namespaces=[orbit.local/project,orbit.local/env]
+          resources:
+            # Measured 48h: peak 30Mi, p99 29Mi — was 4.3x over-reserved.
+            requests: {cpu: 10m, memory: 64Mi}
+            limits: {memory: 128Mi}
+        prometheus-node-exporter:
+          priorityClassName: orbit-platform
+          resources:
+            # Measured 48h: peak 16Mi, p99 15Mi.
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]

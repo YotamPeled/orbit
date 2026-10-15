@@ -1,0 +1,21 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: skip-a
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: charts
+    chart: chart-skip
+    targetRevision: 0.1.0
+    helm:
+      skipCrds: true
+      valuesObject:
+        image: example/skip:1
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: proj-a
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions: [CreateNamespace=true]

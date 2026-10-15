@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workload
+  labels:
+    app.kubernetes.io/instance: classes
+spec:
+  selector:
+    matchLabels:
+      app: workload
+  template:
+    metadata:
+      labels:
+        app: workload
+      annotations:
+        checksum/config: deadbeef
+    spec:
+      containers:
+        - name: c
+          image: example/c:1

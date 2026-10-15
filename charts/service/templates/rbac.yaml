@@ -1,0 +1,78 @@
+{{- /*
+The one place in this chart that grants a workload any Kubernetes API right at all.
+
+It exists for the agent plane's intake service (Phase D.3, AGENT-PLANE.md): the router
+launches a one-shot Job per event, and creating a Job needs `create`. Nothing else on the
+platform needs the API, which is why the default ServiceAccount in workloads.yaml carries
+automountServiceAccountToken: false — a token that is never used is only ever a credential
+to steal.
+
+`rbac.jobRunner` is a ROOT value, deliberately, and never a component key. Component dicts
+pass through from catalog/projects.yaml essentially verbatim, so a component key would let
+any hand-written catalog project mint itself a Role. Root values are assembled by
+scripts/catalog-sync.py from an explicit list plus a local generator-only channel, so this
+directive is reachable only from the generator.
+
+The grant is the narrowest one that works and is enumerated here rather than derived:
+  * apiGroups: batch ONLY  — not "" (that is every core object, Secrets included),
+    not "*"
+  * resources: jobs ONLY   — not jobs/status, not pods, not pods/exec, not cronjobs
+  * verbs: create, get ONLY — no list/watch (the routing table is the router's map of the
+    plane; it has no business enumerating what else runs here), no delete, no patch, no
+    update, and above all no `*`
+  * Role + RoleBinding, never ClusterRole — the right stops at this namespace, which is
+    the namespace the Application is already scoped to.
+
+A Job the router creates does NOT inherit this: the manifest it builds sets the plane's
+ordinary ServiceAccount and automountServiceAccountToken: false (services/intake/app.py,
+job_manifest). Launching something is not the same as delegating to it.
+*/ -}}
+{{- with .Values.rbac }}
+{{- if .jobRunner }}
+{{- $comp := "" }}
+{{- range $c := $.Values.components }}
+{{- if eq $c.name $.Values.rbac.jobRunner }}{{- $comp = $c }}{{- end }}
+{{- end }}
+{{- if not $comp }}
+{{- fail (printf "rbac.jobRunner names component %q, which this release does not declare — the Role would bind a ServiceAccount no pod uses, and the component it was meant for would run with no API rights and fail every dispatch" .jobRunner) }}
+{{- end }}
+{{- $name := printf "%s-%s" $.Values.project .jobRunner }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels: {{- include "service.labels" (dict "root" $ "comp" $comp) | nindent 4 }}
+{{- /* The ONE ServiceAccount on the platform that mounts its token, because this one
+     actually calls the API. */}}
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels: {{- include "service.labels" (dict "root" $ "comp" $comp) | nindent 4 }}
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels: {{- include "service.labels" (dict "root" $ "comp" $comp) | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    {{- /* Derived from the values, NOT from .Release.Namespace. Argo sets the release
+         namespace from the Application's destination, which is right in the cluster and
+         "default" under a bare `helm template` — so every rendered-output check would be
+         asserting against a namespace the binding never has. <project>-<env> is the same
+         name the generator writes on the Namespace object itself. */}}
+    namespace: {{ printf "%s-%s" $.Values.project $.Values.env }}
+{{- end }}
+{{- end }}

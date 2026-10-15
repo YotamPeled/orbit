@@ -1,0 +1,25 @@
+  # ── s17b-scratch: a throwaway project that scenario S17b (orbit-core docs/V1.md §5) asks
+  # an agent to remove. A public image (no pull secret needed) and a dev database holding
+  # a few rows, so the removal has data to back up first.
+  - id: s17b-scratch
+    name: s17b-scratch
+    blurb: Throwaway project for the remove-a-project scenario.
+    repo: stefanprodan/podinfo
+    hosted: self
+    database:
+      size: 1Gi
+      memory: 256Mi
+    environments:
+      dev:
+        enabled: true
+        branch: main
+        expose: false
+    components:
+      - name: web
+        kind: worker
+        class: batch
+        image: ghcr.io/stefanprodan/podinfo
+        port: 9898
+        memory: 64Mi
+        probePath: /healthz
+        readinessPath: /readyz

@@ -1,0 +1,59 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+
+# Scrape the two components that were emitting metrics no one collected (audit 2026-08-28).
+#
+# Alloy is the SOLE path from container stdout to Loki, and Traefik is the ingress every
+# external request crosses. Both had metrics configured (alloy on :12345, traefik on the
+# pod's :9100 via metrics.prometheus.enabled) and NO ServiceMonitor, so neither had an `up`
+# series, no RED signal, and no TargetDown coverage. Alloy's own counters showed a
+# quarter-million log lines dropped (loki_write_dropped_entries_total, reason=ingester_error)
+# on a Ready pod with zero notification — the exact "running but not delivering" gap.
+#
+# These are the scrape targets only. The alert that turns the alloy delivery counters into a
+# page is a separate change; this makes the series exist to alert on.
+# orbit:feature logs
+---
+# Alloy's Service publishes the metrics port (http-metrics/12345), so a ServiceMonitor is the
+# natural fit. The chart could render its own, but the config here is a plain valuesObject
+# with no serviceMonitor block; owning the CR keeps the scrape declaration beside the other
+# monitoring objects (probes, rules) rather than buried in a chart value.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: alloy
+  namespace: alloy
+  labels:
+    app.kubernetes.io/name: alloy
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alloy
+      app.kubernetes.io/instance: alloy
+  endpoints:
+    - port: http-metrics
+      path: /metrics
+      interval: 30s
+# orbit:end logs
+---
+# Traefik is different: its LoadBalancer Service exposes only web/websecure (80/443) — the
+# metrics port (9100) lives on the POD, not the Service — so a ServiceMonitor has no port to
+# select. A PodMonitor scrapes the named container port directly. The operator watches
+# PodMonitors cluster-wide (podMonitorSelectorNilUsesHelmValues: false).
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: traefik
+  namespace: traefik
+  labels:
+    app.kubernetes.io/name: traefik
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: traefik
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s

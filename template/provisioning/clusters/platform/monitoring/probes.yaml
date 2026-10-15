@@ -1,0 +1,38 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# Blackbox probes for the PLATFORM's own public doors. Tenant probes are generated
+# from the catalog (a project with a hostname gets a probe); these are the pieces
+# of Orbit itself that a tenant's checks would never cover. Extra static shapes — a
+# path-specific door, a protected surface — come from `monitoring.probes` in
+# instance/config.yaml ({url, module} entries) and are appended here by instance-init.
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: orbit-platform-surfaces
+  namespace: monitoring
+spec:
+  jobName: platform-probes
+  prober:
+    # The Service the blackbox chart renders under this template's
+    # `fullnameOverride: blackbox-exporter` (clusters/platform/apps/blackbox-exporter.yaml),
+    # on the chart's single Service port. It read
+    # `kube-prometheus-stack-blackbox-exporter.monitoring.svc:9115` — the chart's
+    # DEFAULT name, which the override replaces — until 2026-09-07, so on a fresh scaffold
+    # every probe below was dispatched at a Service that does not exist and was dead on
+    # arrival, with no `probe_success` series and nothing anywhere saying so. The stage
+    # that now catches it parses this field structurally (it is schemeless, so no URL
+    # scan ever saw it): scripts/verify/stage5-platform.sh, "every in-cluster URL names a
+    # port its Service actually declares".
+    url: blackbox-exporter.monitoring.svc:9115
+  module: http_2xx
+  targets:
+    staticConfig:
+      static:
+        # orbit:feature dashboards
+        - https://grafana.{{domains.primary}}/api/health
+        # orbit:end dashboards
+        # The control surface's own door: its health path answers 200 without a token
+        # (the MCP path itself answers 401 to a probe, which is not a health signal).
+        - https://orbit.{{domains.primary}}/healthz

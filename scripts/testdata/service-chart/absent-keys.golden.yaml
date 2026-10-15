@@ -1,0 +1,127 @@
+# Golden render for test_absent_keys_render_byte_identical_to_base: the minimal
+# VALUES_DEFAULTS component rendered against the pre-#43 chart (f25d15a
+# _helpers.tpl + values.schema.json — the change that added the readinessPath
+# and scratch keys, which change nothing for a component that sets neither).
+# Regenerate: python3 scripts/test_service_chart.py --regenerate
+---
+# Source: service/templates/workloads.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: charttest
+  labels:
+    app.kubernetes.io/instance: charttest
+# No workload here talks to the Kubernetes API, so nothing needs a mounted token —
+# and a token that is never used is only ever a credential to steal.
+automountServiceAccountToken: false
+---
+# Source: service/templates/workloads.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: charttest-web
+  labels:
+    app.kubernetes.io/name: web
+    app.kubernetes.io/instance: charttest
+    app.kubernetes.io/part-of: charttest
+    app.kubernetes.io/managed-by: argocd
+    orbit.local/env: prod
+    orbit.local/class: interactive
+spec:
+  selector:
+    app.kubernetes.io/name: web
+    app.kubernetes.io/instance: charttest
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+    # The container's own port, published so an in-cluster caller that dials it reaches
+    # the pods instead of a blackholed address. Prefer port 80 above.
+    - name: http-direct
+      port: 8080
+      targetPort: 8080
+---
+# Source: service/templates/workloads.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: charttest-web
+  labels:
+    app.kubernetes.io/name: web
+    app.kubernetes.io/instance: charttest
+    app.kubernetes.io/part-of: charttest
+    app.kubernetes.io/managed-by: argocd
+    orbit.local/env: prod
+    orbit.local/class: interactive
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web
+      app.kubernetes.io/instance: charttest
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  template:
+    metadata:
+      # Full labels on the pod, not just the selector subset: env and class need to be
+      # queryable in Prometheus, and the selector itself is immutable so it cannot grow.
+      labels:
+        app.kubernetes.io/name: web
+        app.kubernetes.io/instance: charttest
+        app.kubernetes.io/part-of: charttest
+        app.kubernetes.io/managed-by: argocd
+        orbit.local/env: prod
+        orbit.local/class: interactive
+    spec:
+      serviceAccountName: charttest
+      priorityClassName: orbit-interactive
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web
+          image: ghcr.io/example-org/charttest-web:main-0000001
+          imagePullPolicy: IfNotPresent
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: [ALL]
+          ports: 
+            - containerPort: 8080
+              name: http
+          env:
+            - name: ENVIRONMENT
+              value: "prod"
+            - name: OTEL_SERVICE_NAME
+              value: "charttest-web"
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "service.namespace=charttest,deployment.environment.name=prod,service.version=main-0000001"
+          readinessProbe:
+            httpGet:
+              path: "/healthz"
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: "/healthz"
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 256Mi

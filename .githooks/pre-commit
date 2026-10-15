@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# No personal string, no secret, no other author in what is about to be committed
+# (scripts/personal_strings.py). Wired by `git config core.hooksPath .githooks`, which
+# scripts/local-tests.sh sets.
+set -euo pipefail
+root=$(git rev-parse --show-toplevel)
+py=python3; "$py" -c 'import sys' >/dev/null 2>&1 || py=python
+exec "$py" "$root/scripts/personal_strings.py" --staged

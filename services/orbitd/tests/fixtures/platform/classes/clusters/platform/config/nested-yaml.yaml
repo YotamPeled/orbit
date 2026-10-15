@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nested-yaml
+  labels:
+    app.kubernetes.io/instance: classes
+data:
+  tempo.yaml: |
+    server:
+      http_listen_port: 3200
+    metrics:
+      wal: null

@@ -1,0 +1,22 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# One certificate, three SANs. An X.509 wildcard matches exactly one label, so
+# One wildcard per level: *.{{domains.primary}} covers app hosts but NOT
+# All three are needed: the apex for the portfolio, one wildcard for services, one for
+# dev environments. This is Traefik's default certificate (see tlsStore).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: wildcard-{{domains.primaryDashed}}
+  namespace: traefik
+spec:
+  secretName: wildcard-{{domains.primaryDashed}}-tls
+  issuerRef:
+    name: letsencrypt-dns
+    kind: ClusterIssuer
+  dnsNames:
+    - {{domains.primary}}
+    - "*.{{domains.primary}}"
+    - "*.{{domains.dev}}"

@@ -1,0 +1,30 @@
+# What an instance repository never holds. The onboarding run and every later commit of
+# an operator's add whatever changed in the checkout; these are the things that change in
+# it and are not the repository's.
+
+# secrets: sealed values live under clusters/platform/secrets, encrypted; nothing else
+.env
+env
+*.age
+*.key
+orbit-recovery-kit*
+
+# opentofu: the providers (hundreds of MB, GitHub refuses the push), the state and the
+# variables the run writes from the form stay on the operator machine
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.auto.tfvars
+crash.log
+
+# logs: the onboarding run's, and whatever a command was told to write beside it
+*.log
+
+# python bytecode from the vendored scripts
+__pycache__/
+*.pyc
+
+# misc
+.DS_Store
+.claude/worktrees/

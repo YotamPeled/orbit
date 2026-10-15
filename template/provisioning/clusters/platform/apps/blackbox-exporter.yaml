@@ -1,0 +1,86 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+
+# Blackbox exporter: the only component here that checks a service the way a visitor does.
+#
+# Every other signal in this cluster is measured from inside it. A scrape-based `up`
+# says a pod answered a scrape on its Service IP — it stays 1 while the certificate has
+# expired, while Traefik has lost the router, while DNS points somewhere else, and while
+# the front end serves a blank page. Those are the failures a single-node personal cloud
+# actually has, and none of them are visible from within.
+#
+# It also gives the hub and Argo CD their only coverage: neither exposes metrics, and a
+# static site's health is exactly "does a request to the public URL return 200".
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: blackbox-exporter
+  namespace: argocd
+  annotations:
+    # Wave 4: after kube-prometheus-stack (3), because the Probe objects that drive it
+    # are a CRD that arrives with the operator.
+    argocd.argoproj.io/sync-wave: "4"
+spec:
+  project: default
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: prometheus-blackbox-exporter
+    targetRevision: 11.16.0
+    helm:
+      values: |
+        # Without this the Service is named after the release AND the chart —
+        # blackbox-exporter-prometheus-blackbox-exporter — and every Probe object has to
+        # spell that out. The Probes name this host; keep it stable.
+        fullnameOverride: blackbox-exporter
+        priorityClassName: orbit-platform
+        replicas: 1
+        resources:
+          # Measured 48h: peak 23Mi, p99 21Mi.
+          requests: {cpu: 10m, memory: 32Mi}
+          limits: {memory: 64Mi}
+        config:
+          modules:
+            http_2xx:
+              prober: http
+              timeout: 10s
+              http:
+                # IPv4 only. The box has no IPv6 route, and the default "prefer IPv6"
+                # makes every probe pay a connect timeout before falling back — which
+                # reads as a slow site rather than as a probe misconfiguration.
+                preferred_ip_protocol: ip4
+                ip_protocol_fallback: false
+                valid_status_codes: [200]
+                follow_redirects: true
+                # Verify the certificate. A probe that skips verification cannot see
+                # the expiry it exists to warn about.
+                tls_config: {insecure_skip_verify: false}
+                # Identify the prober explicitly rather than leaving it to whatever the
+                # exporter's default happens to be in the version we run. An application
+                # cannot tell a once-a-minute uptime check from a person loading the page
+                # — a low-traffic tenant once counted the probes among its daily visitors and
+                # 97% of its page views — so it needs something stable to exclude, and
+                # something a release of this chart cannot silently rename.
+                headers:
+                  User-Agent: orbit-uptime-probe
+            # A protected dev door is healthy at this layer when Traefik keeps it
+            # closed. This does not claim the application behind basic auth is live;
+            # authenticated liveness is a separate concern and requires credentials.
+            http_401:
+              prober: http
+              timeout: 10s
+              http:
+                preferred_ip_protocol: ip4
+                ip_protocol_fallback: false
+                valid_status_codes: [401]
+                follow_redirects: true
+                tls_config: {insecure_skip_verify: false}
+                headers:
+                  User-Agent: orbit-uptime-probe
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]

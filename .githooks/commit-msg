@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# No personal string and no Co-authored-by trailer in a commit message
+# (scripts/personal_strings.py).
+set -euo pipefail
+root=$(git rev-parse --show-toplevel)
+py=python3; "$py" -c 'import sys' >/dev/null 2>&1 || py=python
+exec "$py" "$root/scripts/personal_strings.py" --message "$1"

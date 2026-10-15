@@ -1,0 +1,130 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# Ingress via a LoadBalancer Service, which k3s' ServiceLB fulfils by binding 80/443 on
+# the node — the same end result as hostPort, but with one property hostPort cannot give:
+# Traefik writes the assigned address back into every Ingress's status.loadBalancer.
+#
+# That status is how anything else knows an Ingress is actually published. Without it
+# Argo CD reports every service Progressing forever and can never say Healthy, which
+# makes "is this deploy live?" unanswerable — the adversarial gate caught exactly that.
+# Traefik's OWN CRDs, wave 0 — see provisioning/clusters/platform/crds/traefik/README.md.
+# The traefik Application below sets skipCrds so a chart sync cannot downgrade the vendored
+# Gateway API bundle; that leaves traefik.io/v1alpha1 unregistered, and the chart's own
+# tlsStore object is in that group, so on a fresh cluster the traefik sync fails at
+# DISCOVERY and the ingress controller never comes up at all. The files are the pinned
+# chart's own crds/traefik.io_*.yaml.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: traefik-crds
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: {{git.repoUrl}}
+    targetRevision: {{git.branch}}
+    path: clusters/platform/crds/traefik
+    directory:
+      recurse: false
+      include: '*.yaml'
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: traefik
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: traefik
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: default
+  source:
+    repoURL: https://traefik.github.io/charts
+    chart: traefik
+    targetRevision: 37.1.1
+    helm:
+      # The chart's crds/ dir bundles OLDER Gateway API CRDs and Argo renders chart CRDs
+      # unconditionally — left alone, a traefik sync DOWNGRADES the v1.6 bundle vendored
+      # in config/gateway-api/ that the MCP plane runs on (caught as a live OutOfSync
+      # fight). Consequence to own: traefik's OWN CRD upgrades become deliberate platform
+      # changes, exactly like that vendored bundle.
+      skipCrds: true
+      values: |
+        deployment:
+          kind: Deployment
+          replicas: 1
+        # Traefik is the trace ROOT (OBSERVABILITY.md Decision 4): every external
+        # request gets a real root span regardless of node placement or app language;
+        # in-process SDKs parent under it via tracecontext. 100% sampling by design.
+        # Rendered only while the traces feature is on: without Tempo there is nothing
+        # to export to.
+        # orbit:feature traces
+        tracing:
+          sampleRate: 1.0
+          otlp:
+            enabled: true
+            http:
+              enabled: true
+              endpoint: http://tempo.tempo.svc.cluster.local:4318/v1/traces
+        # orbit:end traces
+        # The OTel SDK's resource detector calls user.Current(), which needs cgo or
+        # $USER; the distroless non-root image has neither, and the tracer fails at
+        # startup with ONE warn line and zero spans forever. Found by execution.
+        env:
+          - name: USER
+            value: traefik
+        service:
+          enabled: true
+          type: LoadBalancer
+          # Without this, klipper SNATs every request and Traefik sees 10.42.0.1 as the
+          # client — access logs, X-Forwarded-For, rate limits and any future IP
+          # allowlist all go blind. Matters most for any latency-critical tenant.
+          spec:
+            externalTrafficPolicy: Local
+        ports:
+          web:
+            redirections:
+              entryPoint:
+                to: websecure
+                scheme: https
+                permanent: true
+          websecure:
+            http3: {enabled: false}
+        # Without a default certificate, any hostname without its own Ingress is served
+        # Traefik's self-signed cert. Both live domains carry a one-year HSTS pin, so a
+        # self-signed response is a hard browser failure with no click-through — this
+        # store is what makes that impossible.
+        tlsStore:
+          default:
+            defaultCertificate:
+              secretName: wildcard-{{domains.primaryDashed}}-tls
+        providers:
+          kubernetesCRD: {enabled: true, allowCrossNamespace: false}
+          # publishedService is what populates Ingress status from the Traefik Service.
+          kubernetesIngress: {enabled: true, publishedService: {enabled: true}}
+        logs:
+          general: {level: INFO}
+          access: {enabled: true}
+        metrics:
+          prometheus: {enabled: true}
+        resources:
+          # Measured 48h under real ingress traffic: peak 57Mi, p99 53Mi. 96Mi = peak
+          # +68%; the 256Mi limit is untouched, so a traffic spike still has 2.7x the
+          # measured peak to grow into.
+          requests: {cpu: 50m, memory: 96Mi}
+          limits: {memory: 256Mi}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: traefik
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]

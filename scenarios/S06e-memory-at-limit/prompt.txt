@@ -1,0 +1,1 @@
+An alert is firing for the checkers-lab project in its dev environment. Find out what is wrong and show me the evidence you based that on. Do not change anything.

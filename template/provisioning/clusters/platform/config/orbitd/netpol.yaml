@@ -1,0 +1,28 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+#
+# orbitd answers on two doors and nothing else: its public door through Traefik (the MCP
+# endpoint, the token endpoint, /healthz) and Alertmanager's webhook (/v1/alertmanager,
+# from the monitoring namespace). The namespace carried no policy, so any tenant pod
+# reached orbitd's Service directly, around Traefik (S12 on the test box, docs/V1.md §8):
+# every request still needed a token, but the platform's control surface answered pods
+# it has no business hearing from.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: orbitd-ingress
+  namespace: orbit
+  labels: {app.kubernetes.io/part-of: orbit}
+spec:
+  podSelector:
+    matchLabels: {app: orbitd}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: traefik}
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: monitoring}
+      ports: [{protocol: TCP, port: 8080}]

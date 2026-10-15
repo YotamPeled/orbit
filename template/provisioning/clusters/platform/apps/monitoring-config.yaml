@@ -1,0 +1,33 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# Probes and alert rules — the objects that turn the stack into something that tells you.
+#
+# A separate Application from platform-config for one reason: these are custom resources
+# owned by the Prometheus operator, and platform-config runs in wave 2, before the operator
+# and its CRDs exist. Putting a Probe there does not merely fail; it fails the whole
+# platform-config sync, so a monitoring typo would take cert-manager's issuers down with it.
+#
+# Wave 5: after the operator (3) and the blackbox exporter (4) the Probes point at.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: monitoring-config
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  project: default
+  source:
+    repoURL: {{git.repoUrl}}
+    targetRevision: main
+    path: clusters/platform/monitoring
+    directory:
+      recurse: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]

@@ -1,0 +1,4 @@
+apiVersion: v2
+name: chart-a
+version: 0.1.0
+description: fixture chart for orbit platform plan

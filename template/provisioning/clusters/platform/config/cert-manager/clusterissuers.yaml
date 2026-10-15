@@ -1,0 +1,39 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# Two issuers, because a service can own domains in a zone we run DNS for and domains we
+# do not. DNS-01 can issue before traffic points here (essential for pre-issuing a cert
+# ahead of a cutover) and is the only way to get a wildcard. HTTP-01 is the fallback for
+# zones outside Cloudflare, and requires the domain to already resolve to this box.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-dns
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: {{contacts.email}}
+    privateKeySecretRef:
+      name: letsencrypt-dns-account
+    solvers:
+      - dns01:
+          cloudflare:
+            apiTokenSecretRef:
+              name: cloudflare-api-token
+              key: api-token
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-http
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: {{contacts.email}}
+    privateKeySecretRef:
+      name: letsencrypt-http-account
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: traefik

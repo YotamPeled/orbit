@@ -1,0 +1,39 @@
+# Test catalog for scripts/test_catalog_quota.py. Hostnames use example.org — the
+# same fixture domain the probe tests use — so the generator has something to
+# render and the leak oracle never sees a real org.
+version: 3
+projects:
+  - id: widgets
+    name: Widgets
+    hosted: self
+    database:
+      size: 2Gi
+      memory: 256Mi
+    environments:
+      prod: {}
+      dev:
+        enabled: true
+    components:
+      - name: web
+        kind: web
+        image: example/web
+        port: 8080
+        path: /
+        memory: 256Mi
+      - name: importer
+        kind: worker
+        image: example/importer
+        class: batch
+        singleton: true
+        memory: 512Mi
+  - id: bare
+    name: Bare
+    hosted: self
+    environments:
+      prod: {}
+    components:
+      - name: web
+        kind: web
+        image: example/web
+        port: 8080
+        path: /

@@ -1,0 +1,46 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# Lock Loki's ingress (audit 2026-08-28 HIGH). The loki namespace carried no NetworkPolicy,
+# so from any pod in the cluster Loki's :3100 answered query_range (every namespace's logs,
+# including a production tenant's), accepted /api/v1/push (log forgery under any namespace label,
+# auth_enabled: false) and served /api/v1/delete — a compromised public pod could read every
+# log line, forge more, and delete the record of its own compromise by selector.
+#
+# Selects the loki pod and switches it to default-deny ingress, admitting only its real
+# clients on :3100 — Alloy (the log push), and the monitoring namespace (Grafana's queries
+# and Prometheus's scrape of Loki's /metrics) — plus same-namespace traffic for the single
+# binary's own memberlist/gRPC. Ingress-only: Loki's egress to the S3 bucket is untouched.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: loki-ingress
+  namespace: loki
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: loki
+  policyTypes: [Ingress]
+  ingress:
+    # The HTTP surface (:3100): push from Alloy, queries + metrics scrape from monitoring.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: alloy
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - {protocol: TCP, port: 3100}
+    # orbitd reads Loki on :3100.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: orbit
+      ports:
+        - {protocol: TCP, port: 3100}
+    # Same-namespace: the single binary talks to itself (memberlist :7946, gRPC :9095) via
+    # the Service; a present policy would otherwise deny those self-directed connections.
+    - from:
+        - podSelector: {}

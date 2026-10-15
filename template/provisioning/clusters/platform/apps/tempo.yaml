@@ -1,0 +1,112 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# Tempo, single binary, on the bucket — OBSERVABILITY.md Phase 3. The design named
+# "monolithic 2.10"; the single-binary chart currently ships 2.9.0 — recorded delta,
+# same mode. Traces arrive over OTLP from Traefik (the root span) and, in Phase 4,
+# from injected SDKs — those are the only trace writers by design.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: tempo
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  project: default
+  source:
+    repoURL: https://grafana.github.io/helm-charts
+    chart: tempo
+    targetRevision: 1.24.4
+    helm:
+      valuesObject:
+        tempo:
+          reportingEnabled: false
+          # The chart defaults to a 1 GiB Go ballast — a third of this box's headroom
+          # spent pre-touching pages. Off; GOMEMLIMIT-style pressure is not our regime.
+          memBallastSizeMbs: 0
+          resources:
+            # 384Mi request, 1Gi limit, both bought by execution. Steady state is
+            # ~108Mi; the cost is not steady state, it is the moment the ingester CUTS and
+            # COMPLETES its head block, which it does holding the whole block. Measured
+            # peak: 509.2Mi against the old 512Mi limit — SIGKILLed at the flush, every
+            # time, 14 restarts. The request drops to 384Mi (steady state plus room
+            # for the span-metrics generator's series); the LIMIT stays 1Gi, because
+            # only the ceiling survives the flush — lowering it brings the OOMs back.
+            # Raising the ceiling alone would only move the wall, so the bounds below
+            # keep the spike an order of magnitude smaller than it.
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              memory: 1Gi
+          # The head block is not just a storage detail — it is the SEARCH ANCHOR. A
+          # no-time-range /api/search is an ingester search that walks the head block from
+          # its first trace and stops at `limit`, so with the chart's 30m/1h defaults (and
+          # a pod that died at every flush, so no block was EVER cut: blocks_flushed=0)
+          # the anchor freezes at the pod's first seconds and `?limit=20` returns the same
+          # twenty traces for hours. Rolling every 5m keeps the anchor near the present,
+          # makes each completion cheap enough to survive, and caps what an unexpected
+          # restart loses at 5 minutes — persistence is off, so /var/tempo (WAL + block
+          # staging) is the container's ephemeral layer.
+          ingester:
+            max_block_duration: 5m
+            max_block_bytes: 52428800
+            complete_block_timeout: 15m
+          # Bounded by design like Loki's 24h: traces are for investigating THIS week's
+          # incident, not archaeology. 72h is deliberate and cheap on the bucket.
+          retention: 72h
+          storage:
+            trace:
+              backend: s3
+              s3:
+                bucket: {{objectStorage.buckets.platform}}
+                endpoint: {{objectStorage.endpointHost}}
+                prefix: tempo
+                access_key: ${S3_ACCESS_KEY}
+                secret_key: ${S3_SECRET_KEY}
+          # The generator is what turns traces into RED span metrics. Service graphs
+          # are off since the 2026-09-10 diet: Grafana no longer asks for the map,
+          # so the generator skips them. Cardinality locks: span metrics multiply
+          # service × span_name × status, and one URL-templated span name melts a
+          # small Prometheus — so dimensions stay at exactly ONE beyond the
+          # intrinsic set, deployment.environment.name, which is what lets the
+          # generated worker panels tell one environment's traffic from another's
+          # (the chart already sets it on every workload's OTEL_RESOURCE_ATTRIBUTES).
+          # The hard max_active_series below bounds the product after that dimension.
+          metricsGenerator:
+            enabled: true
+            remoteWriteUrl: "http://kube-prometheus-stack-prometheus.monitoring:9090/api/v1/write"
+            # The metric -> trace link (docs/V1.md §6.1): span metrics carry an exemplar
+            # naming a trace, but Tempo's remote write sends exemplars only when told to,
+            # and the chart's remoteWriteUrl form cannot say it. The list form is used
+            # verbatim; Prometheus stores them with its exemplar-storage feature.
+            storage:
+              path: /tmp/tempo
+              remote_write:
+                - url: "http://kube-prometheus-stack-prometheus.monitoring:9090/api/v1/write"
+                  send_exemplars: true
+          overrides:
+            defaults:
+              metrics_generator:
+                processors: [span-metrics]
+                processor:
+                  span_metrics:
+                    dimensions: ["deployment.environment.name"]
+                max_active_series: 15000
+          extraArgs:
+            config.expand-env: "true"
+          extraEnv:
+            - name: S3_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: orbit-s3, key: S3_ACCESS_KEY}}
+            - name: S3_SECRET_KEY
+              valueFrom: {secretKeyRef: {name: orbit-s3, key: S3_SECRET_KEY}}
+        serviceMonitor:
+          enabled: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: tempo
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]

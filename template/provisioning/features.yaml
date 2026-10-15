@@ -1,0 +1,152 @@
+# The features registry: what an Orbit platform is made of, and which parts are optional.
+#
+# `core` is always on. Every other feature is switched in instance/config.yaml under
+# `features:` (scripts/verify/orbit_features.py reads both files; the scaffolder, the
+# generator, the verify stages and orbitd all ask it, so they cannot disagree).
+#
+# Per feature:
+#   summary     one sentence for a person choosing.
+#   requires    what must be there first: `bucket` (objectStorage.buckets.platform) or
+#               another feature.
+#   secrets     the sealed secrets it needs, as <namespace>/<name>: the file
+#               clusters/platform/secrets/<namespace>/<name>.yaml in the instance repo.
+#   apps        the platform Applications it owns outright: applied when it is turned
+#               on, retired when it is turned off.
+#   consumers   the Applications of other features that change with it (they carry its
+#               blocks, or its files sit in their directory): re-applied with prune
+#               whenever it is switched.
+#   paths       the files under clusters/ it owns (a directory covers what is under it).
+#               Every platform file belongs to exactly one feature
+#               (scripts/test_features_registry.py). Lines it owns inside another
+#               feature's file sit between `# orbit:feature <name>` and
+#               `# orbit:end <name>` there.
+#   tools       the MCP tools that exist only while it is on.
+#
+# A feature may own no file at all: it then lives entirely in blocks of other features'
+# files, or in a `{{features.<name>}}` value there (a chart told `enabled: false`).
+#   memory_mib  resident memory its own workloads hold on an idle box, measured on the
+#               reference node (2026-10-06, docs/PRODUCT.md). What `orbit features list`
+#               shows as `memory_mib` is the same thing measured now, on this box.
+features:
+  core:
+    always: true
+    summary: >-
+      The cluster's doors and certificates, sealed secrets, metrics and alerts, and
+      orbitd: everything needed to ship and run a project.
+    apps:
+      - cert-manager
+      - kube-prometheus-stack
+      - monitoring-config
+      - platform-config
+      - secrets
+      - services
+      - sops-secrets-operator
+      - traefik
+      - traefik-crds
+    paths:
+      - platform/apps/cert-manager.yaml
+      - platform/apps/kube-prometheus-stack.yaml
+      - platform/apps/monitoring-config.yaml
+      - platform/apps/platform-config.yaml
+      - platform/apps/secrets.yaml
+      - platform/apps/services.yaml
+      - platform/apps/sops-secrets-operator.yaml
+      - platform/apps/traefik.yaml
+      - platform/config/cert-manager
+      - platform/config/gateway-api
+      - platform/config/monitoring
+      - platform/config/orbit-intake
+      - platform/config/orbitd
+      - platform/config/priorityclasses.yaml
+      - platform/crds/traefik
+      - platform/monitoring/rules.yaml
+      - platform/monitoring/scrape-collectors.yaml
+  logs:
+    memory_mib: 184
+    summary: >-
+      Every pod's logs kept in Loki for 7 days, searchable by project, environment and
+      component. Off, logs are read from the node and last only as long as the pod.
+    requires: [bucket]
+    secrets: [loki/orbit-s3]
+    apps: [loki, alloy]
+    consumers: [platform-config, monitoring-config, kube-prometheus-stack]
+    paths:
+      - platform/apps/alloy.yaml
+      - platform/apps/loki.yaml
+      - platform/config/loki
+  traces:
+    memory_mib: 269
+    summary: >-
+      Request traces from the ingress through each component to the database, kept in
+      Tempo, linked from logs and metrics.
+    requires: [bucket]
+    secrets: [tempo/orbit-s3]
+    apps: [tempo, opentelemetry-operator]
+    # `services` carries the tenant Instrumentation objects the generator writes while
+    # traces is on.
+    consumers: [platform-config, monitoring-config, kube-prometheus-stack, traefik, services]
+    paths:
+      - platform/apps/opentelemetry-operator.yaml
+      - platform/apps/tempo.yaml
+      - platform/config/tempo
+    tools: [orbit_traces_find, orbit_traces_get]
+  dashboards:
+    memory_mib: 237
+    summary: >-
+      Grafana at grafana.<domain>: a dashboard per project environment, the platform's
+      own, and a place to look at logs and traces. Off, the metrics and alerts still run
+      and are read through orbitd's tools.
+    secrets: [monitoring/grafana-admin, monitoring/grafana-image-renderer-token]
+    # Grafana is part of the metrics stack's chart, told on or off by a value; the
+    # generator writes each project's dashboard into `services`; the platform probe of
+    # Grafana's door is a block in `monitoring-config`.
+    consumers: [kube-prometheus-stack, monitoring-config, services]
+    tools: [orbit_dashboards_check]
+  uptime:
+    memory_mib: 10
+    summary: >-
+      Every public door (the platform's own and each project's) is checked from outside
+      once a minute; a door that stops answering, or a certificate about to expire, raises
+      an alert. Off, nothing watches the doors.
+    apps: [blackbox-exporter]
+    # The platform's own probes are a file in `monitoring-config`'s directory and its
+    # two alert rules a block there; each project's probe is written into `services`.
+    consumers: [monitoring-config, services]
+    paths:
+      - platform/apps/blackbox-exporter.yaml
+      - platform/monitoring/probes.yaml
+  databases:
+    memory_mib: 32
+    summary: >-
+      A project may declare a PostgreSQL database (CloudNativePG runs it). Off, the
+      operator is not installed and a catalog entry with `database:` is refused.
+    apps: [cloudnative-pg]
+    # the operator's own certificates, owned by its Deployment: they go with it
+    generated: [cnpg-system/cnpg-ca-secret, cnpg-system/cnpg-webhook-cert]
+    consumers: [monitoring-config]
+    paths:
+      - platform/apps/cloudnative-pg.yaml
+    tools: [orbit_db_status, orbit_db_backup, orbit_db_restore]
+  backups:
+    memory_mib: 14
+    summary: >-
+      A prod database archives its write-ahead log and takes base backups to the bucket,
+      so it can be restored to a point in time. Off (or with no bucket), a database is
+      backed up by a nightly dump kept on the node.
+    requires: [bucket, databases]
+    # the bucket keys for the Jobs orbitd starts (orbit_db_backup copies each dump there)
+    secrets: [orbit/orbit-s3]
+    # the barman-cloud plugin's manifest is a directory under `platform-config`; the two
+    # archive alerts are a block in `monitoring-config`
+    consumers: [platform-config, monitoring-config]
+    paths:
+      - platform/config/barman-cloud
+  alerts-telegram:
+    memory_mib: 0
+    summary: >-
+      Every alert is also sent to a Telegram chat. Off, alerts are still raised, recorded
+      and read through orbitd's tools (orbit_alerts_active); nobody is messaged.
+    secrets: [monitoring/alertmanager-telegram]
+    # It owns no file: the Telegram notifier is a block of the human receiver in the
+    # metrics stack's Alertmanager config, and its bot token one entry of the mount list.
+    consumers: [kube-prometheus-stack]

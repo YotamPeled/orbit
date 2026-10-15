@@ -1,0 +1,54 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+
+# CloudNativePG. Postgres as a Kubernetes resource: a `Cluster` object per database,
+# with the operator owning bootstrap, failover, backups and — the reason it is here
+# rather than a hand-rolled StatefulSet — credential generation. Every database user is
+# created by the operator and published as a Secret it owns, so no database password is
+# ever chosen by a human, typed into Infisical, or committed anywhere.
+#
+# That is also why this is NOT redundant with External Secrets. ESO holds what apps
+# consume and a human authored; CNPG holds what nobody ever sees.
+#
+# Wave -1 with the other operators: a service in wave 10 may declare a database, and the
+# CRD has to exist before its Cluster can be applied.
+#
+# ServerSideApply for the same reason as ESO — the Cluster CRD alone is well past the
+# 262144-byte last-applied-configuration annotation limit, so a client-side apply fails
+# outright rather than degrading.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cloudnative-pg
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  project: default
+  source:
+    repoURL: https://cloudnative-pg.github.io/charts
+    chart: cloudnative-pg
+    targetRevision: 0.29.0
+    helm:
+      values: |
+        # One replica: the operator is a leader-elected control loop with no request path
+        # in front of it, and a second replica on a single node buys nothing while a PDB
+        # expecting two would block a drain forever.
+        replicaCount: 1
+        resources:
+          # Measured 48h: peak 43Mi, p99 41Mi — 192Mi reserved 4.5x the peak. Limit
+          # unchanged at 192Mi.
+          requests: {cpu: 10m, memory: 64Mi}
+          limits: {memory: 192Mi}
+        monitoring:
+          # No Prometheus operator until stage 5. A PodMonitor whose CRD does not exist
+          # fails the whole sync, not just the metric.
+          podMonitorEnabled: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cnpg-system
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]

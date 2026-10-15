@@ -1,0 +1,31 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# The generated per-service Applications. Separate from the platform tree so a broken
+# service Application can never block a platform sync, and sync-wave 10 keeps every
+# service behind the platform components it depends on.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: services
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  project: default
+  source:
+    repoURL: {{git.repoUrl}}
+    targetRevision: main
+    path: clusters/apps
+    # No `directory: {recurse: false}` here even though that is the intent. `false` is the
+    # zero value, so the API server drops the field on write; Argo then diffs a desired
+    # manifest that has it against a live object that never will, and the Application is
+    # permanently OutOfSync no matter how many times it syncs successfully. Non-recursive
+    # is Argo's default, so stating it costs a convergence and buys nothing.
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions: [ServerSideApply=true]

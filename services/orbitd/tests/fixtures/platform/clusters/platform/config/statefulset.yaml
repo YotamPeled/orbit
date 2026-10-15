@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sts-a
+spec:
+  serviceName: sts-a
+  selector:
+    matchLabels:
+      app: sts-a
+  template:
+    metadata:
+      labels:
+        app: sts-a
+    spec:
+      containers:
+        - name: c
+          image: example/sts:1
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

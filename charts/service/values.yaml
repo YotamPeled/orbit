@@ -1,0 +1,267 @@
+# Defaults for the shared service chart.
+#
+# You do not write these by hand — scripts/catalog-sync.py renders them into each
+# generated Argo Application from catalog/projects.yaml. They are documented because the
+# generated output is meant to be readable.
+
+# Identity -------------------------------------------------------------------
+project: ""        # catalog id, e.g. "widgets"
+env: prod          # prod | dev
+
+# Routing --------------------------------------------------------------------
+# Grouped by ACME challenge type, precomputed by the generator: one Certificate cannot
+# span two issuers, and a service may legitimately own domains in a zone we run DNS for
+# and domains we do not.
+tlsGroups: []
+#  - secretName: widgets-prod-tls
+#    issuer: letsencrypt-dns     # letsencrypt-dns | letsencrypt-http
+#    hosts: [widgets.example.invalid]
+
+hostnames: []      # every host for this service+env
+
+# Access control -------------------------------------------------------------
+# A dev URL is a public URL; basic auth is the cheapest thing that stops it being
+# publicly usable. The chart creates the Middleware, but NOT the credential Secret —
+# that comes from the catalog-generated ExternalSecret dev-basic-auth in
+# clusters/apps/namespaces.yaml, because a generated Application is committed in
+# plaintext and an htpasswd in its values would be a credential in git.
+#
+# Note the failure mode this arrangement has: Traefik disables a router whose middleware
+# or secret is missing or unparseable, so a broken credential yields 404, not 401 — the
+# guard is simply absent. Stage 3's verification asserts 401 explicitly for that reason.
+protected: false   # the generator sets this true for every non-prod environment
+
+# Secrets --------------------------------------------------------------------
+# Declares every Kubernetes Secret this service's pods are allowed to reference. Entries
+# without `from: external` are produced by this chart as ExternalSecrets, which ESO fills
+# from the environment's Infisical store — so git holds the pointer and never the value.
+#
+# The declaration is also the guard. A component referencing a Secret that is not listed
+# here fails to render, because Kubernetes will not fail it at runtime: a missing
+# secretKeyRef parks the pod in CreateContainerConfigError, and a missing envFrom Secret
+# is skipped in total silence, leaving the process running without the variable it needs.
+secrets: []
+#  - name: widgets-app         # the Kubernetes Secret to create
+#    keys: [API_TOKEN]         # remote keys in Infisical, same names in the Secret
+#  - name: widgets-db
+#    from: external            # produced elsewhere (CNPG, sops) — declared, not created
+
+# Database -------------------------------------------------------------------
+# Declared, not configured. Setting this renders a CloudNativePG Cluster; CNPG creates
+# the database, the role and the password and publishes them in a Secret named
+# <project>-db-app, which the chart declares automatically so components may reference
+# it. No database credential is ever written by a person.
+#
+# Backups follow the instance's shape: with `s3` (below) set the Cluster WAL-archives
+# continuously to the platform bucket and takes a nightly base backup — point-in-time
+# recovery, proven by scripts/pitr-drill.sh. Without s3 it falls back to a nightly
+# pg_dump to a local volume. The generator sets s3 for prod databases only: dev data
+# is disposable by design.
+database: {}
+#  size: 2Gi              # data volume
+#  memory: 256Mi          # request AND limit, as everywhere else
+#  cpu: 100m
+#  image: ghcr.io/cloudnative-pg/postgresql:17.9-standard-trixie   # pinned; see database.yaml
+#  backup: {schedule: "0 3 * * *", keep: 7, size: 1Gi}
+#  archiveGeneration: 2   # bump after a disaster recovery — barman refuses a non-empty
+#                         # archive path, so a recreated cluster writes under /genN
+#  parameters:            # Postgres GUC name → string, rendered as spec.postgresql.parameters.
+#    max_connections: "100"   # the two the product sets; keys must match ^[a-z_]+$
+#    shared_buffers: "64MB"   # absent: no postgresql block (byte-identical)
+
+# Workloads ------------------------------------------------------------------
+components: []
+#  - name: web
+#    kind: web        # web    → Deployment + Service + Ingress path
+#                     # worker → Deployment only
+#                     # cron   → CronJob
+#    class: interactive   # interactive | batch | background  (see resourceClasses)
+#    image: ghcr.io/example/widgets-web
+#    tag: latest
+#    port: 8080           # the Service publishes BOTH 80 (name: http, the address to
+#                         # use) and this number, so an in-cluster caller that dials
+#                         # either one reaches the pods
+#    path: /              # web only; two web components may not share a path
+#    hosts: []            # optional: bind to a subset of hostnames
+#    replicas: 1
+#    singleton: false     # Recreate + exactly one pod
+#    schedule: ""         # cron only
+#    memory: 256Mi        # the RESERVATION, and the limit too unless memoryLimit splits
+#                         # them (see below)
+#    memoryLimit: ""      # optional ceiling ABOVE the reservation. Only for a workload
+#                         # whose steady state and whose peak are genuinely different
+#                         # numbers — see "Memory" below before reaching for it.
+#    cpu: ""              # override the class default; rarely needed
+#    language: python     # python|dotnet|nodejs|java — turns on OTel SDK injection
+#                         # (operator webhook). Go is deliberately absent: compile-time
+#                         # otelc, never the maintenance-mode inject-go agent.
+#    env: {}              # VAR: literal, or VAR: {secret: <name>, key: <key>}
+#    envFromSecrets: []   # Secret names to pull wholesale; all must be declared above
+#    probePath: ""
+#    readinessPath: ""    # optional: readinessProbe uses this, livenessProbe keeps probePath
+#    readOnlyRootFilesystem: false   # with true, anything writable needs scratch below
+#    drain: 30             # terminationGracePeriodSeconds. Workers: SIGTERM only, no
+#                         # preStop. Web: existing preStop stays; must exceed
+#                         # drain.preStopSeconds. Cron: refused. Absent: today's render.
+#    scratch: {mountPath: /tmp/scratch, sizeLimit: 512Mi}   # memory-backed emptyDir;
+#                         # requires memoryLimit strictly greater than sizeLimit
+#    metrics: {port: 8080, path: /metrics}
+#    persistence: {size: 5Gi, mountPath: /data}
+#    configMap: {name: c, mountPath: /srv, items: [{key: k, path: sub/dir.md}]}
+#                     # mount a ConfigMap read-only. `items` projects each key to its own
+#                     # path inside the mount, subdirectories included — that is how an
+#                     # agent's skills library arrives as <skill>/SKILL.md, which is the
+#                     # only layout the agent runtime discovers.
+#    securityContext: {}  # merged over the hardened default
+
+# Egress narrowing -----------------------------------------------------------
+# The value stamped beside the orbit.local/egress label on a narrowed pod's
+# template, and matched by the per-component NetworkPolicy the generator
+# renders. Declared here — a document both sides parse — rather than as a
+# literal in two files: a quoted respelling a formatter introduces unasked
+# would otherwise desynchronise the two halves, leaving the pod selected by
+# no policy at all. scripts/catalog-sync.py reads this same key and refuses
+# when the chart's templates stamp anything else.
+egressLabelValue: declared
+
+# Graceful roll --------------------------------------------------------------
+# Chart-level defaults for the components that sit behind an Ingress AND roll
+# (`kind: web` with a `port`, not `singleton`). A component may set `drain:` (integer
+# seconds) to name its own terminationGracePeriodSeconds: workers then get a grace
+# period and no preStop (they drain on SIGTERM); web keeps the preStop sleep below
+# and the value must exceed it. Components that set no `drain:` render as before.
+# Catalog `environments.<env>.components.<name>.drain` overlays that integer for one
+# environment without changing the default.
+#
+# The defect this exists for, measured live on a tenant web service 2026-08-30 at 1s
+# resolution: a
+# RollingUpdate with maxUnavailable:0 produced ~3s of 502 at the router, roughly half of
+# requests, with the terminating pod's own logs showing nothing wrong. A pod leaves the
+# Endpoints of its Service and leaves a router's load-balancer pool at two DIFFERENT
+# times: SIGTERM is delivered to the container immediately, while the EndpointSlice
+# write, the router's watch and the router's config reload all land afterwards. Traefik's
+# providersThrottleDuration is 2s by default, which is most of the measured window. In
+# between, a pod that has already closed its listener is still being sent traffic.
+#
+# preStopSeconds keeps the process serving across that window: the pod is deleted, every
+# router drops it, and only THEN does the app get SIGTERM.
+#
+# Note what is NOT here: `minReadySeconds`. It gates when the Deployment considers a new
+# pod *available* (and so when it scales the old one down); it does not gate when the pod
+# joins the Service's EndpointSlice — that happens the instant it is Ready, either way.
+# It cannot close an arrival-edge gap, and it does not shrink this one; it only moves the
+# same departure race later by however many seconds it names.
+drain:
+  # Long enough to cover the measured ~3s window (Traefik's 2s config throttle plus watch
+  # propagation) with headroom, short enough that it is not felt: it is added to every
+  # pod termination for these components, and the roll surges before it drains, so it
+  # costs latency on the rollout, never availability.
+  preStopSeconds: 5
+  # Wall clock from delete to SIGKILL — it must cover the sleep AND the app's own
+  # shutdown afterwards. 30 is the Kubernetes default, so 25s of real drain remains
+  # after the 5s sleep; the chart refuses to render if this does not exceed preStopSeconds.
+  gracePeriodSeconds: 30
+
+# Resource policy ------------------------------------------------------------
+# CPU: request always, limit NEVER. CPU is compressible — the request sets the cgroup
+# weight, so the ratio between requests is the ratio of CPU under contention. A limit
+# would throttle its own pod in hard stops even on an idle machine and protects nobody.
+#
+# The 25:2:1 spread between interactive, batch and background is the entire isolation
+# mechanism: a batch job soaks up idle CPU and yields within one scheduling period the
+# moment an interactive request arrives.
+#
+# Memory: limit always. Memory is not compressible, so a "fair share" of
+# already-allocated RAM does not exist, and an unbounded container is one that takes the
+# node down instead of itself.
+#
+# Note these pods are QoS class *Burstable*, not Guaranteed — Guaranteed additionally
+# requires a CPU limit, which the policy above deliberately refuses. That is the correct
+# trade and the OOM protection still works, because for Burstable pods the kernel's
+# oom_score_adj scales inversely with the memory *request*: roughly
+#   1000 - (1000 * memory_request / node_allocatable)
+# so a large request also minimises the score. A listener holding an in-memory dataset at
+# 768Mi is meaningfully
+# harder to kill than a 64Mi batch job — which was exactly the property missing when every
+# pod requested 64Mi and they all tied at 998.
+#
+# `memory` is the request and, by default, the limit too: one number, the shape every
+# component here had until 2026-08-31, and still the right shape for the overwhelming
+# majority of them. A server whose resident set is flat should reserve exactly what it
+# holds.
+#
+# `memoryLimit` splits them, and exists because one workload class genuinely cannot be
+# described by a single number. The agent runtime is the example that forced it: the pod
+# is a small Python HTTP server that SPAWNS the `claude` CLI — a Node binary — as a
+# subprocess per task. Idle it holds 14Mi; warm it holds ~51Mi; for the minute a task runs
+# it holds ~161Mi resident and ~275Mi working set. One number cannot be both honest
+# numbers: sized at the peak it reserves 512Mi around the clock for a pod that is idle
+# almost always (measured 35x its own p99 — the exact waste docs/phase-rs-measurements.md
+# exists to remove), and sized at the steady state it OOMKills on its first real task.
+#
+# The split is the same one Phase RS already made for platform components and wrote down
+# there: **a request is a scheduling reservation and an eviction rank; a limit is what the
+# kernel kills on.** So:
+#
+#   request = the steady state (+~30%), because that is what the scheduler must hold.
+#   limit   = at or above the observed peak, because that is the only number that
+#             protects a burst — and it is never cut.
+#
+# The cost is honest and small: below its request a pod's eviction rank rises, so a
+# bursting agent is ranked for eviction ahead of a pod living inside its reservation.
+# That is the correct ordering, not a regression — a demo agent mid-burst SHOULD yield
+# to a production listener sitting inside the RAM it reserved.
+#
+# This is not a general-purpose knob for making a check green. Reach for it only with a
+# measurement in hand showing peak/p99 > 3 for the container in question, and record the
+# measurement next to the declaration.
+resourceClasses:
+  interactive:
+    cpu: 250m
+    priorityClassName: orbit-interactive
+  batch:
+    cpu: 20m
+    priorityClassName: orbit-batch
+  background:
+    cpu: 10m
+    priorityClassName: orbit-background
+
+defaultClass: interactive
+defaultMemory: 256Mi
+
+# Object storage -------------------------------------------------------------
+# Set by the generator from the instance config's objectStorage block, prod databases
+# only. Credentials are NOT here: the chart declares an orbit-s3 Secret (via `secrets`)
+# that ESO fills from the environment's Infisical store — git holds pointers, never keys.
+s3: {}
+#  bucket: <instance-platform-bucket>
+#  endpoint: https://fsn1.your-objectstorage.com
+#  retention: 7d          # barman retentionPolicy for base backups + WAL
+
+# Kubernetes API rights. Empty for every workload on the platform except one: the agent
+# plane's intake, which creates a one-shot Job per event (Phase D.3). Set ONLY by
+# scripts/catalog-sync.py, from a channel no catalog entry can address — it is a root
+# value rather than a component key precisely so a hand-written catalog project cannot
+# mint itself a Role. The grant it produces is fixed in templates/rbac.yaml (batch/jobs,
+# create + get, namespaced) and nothing here can widen it.
+rbac: {}
+#  jobRunner: intake
+
+# Cluster-wide ---------------------------------------------------------------
+# Empty until a GHCR read token exists and the generator emits the Secret per namespace.
+# Naming a Secret that does not exist is not free: the kubelet warns on every pod and the
+# first private image fails to pull. Set this only once the Secret is really there —
+# verify/stage3.sh asserts that every referenced pull secret exists.
+imagePullSecret: ""
+ingressClass: traefik
+storageClassName: local-path   # single node today; becomes hcloud-volumes at node #2
+
+# Hardened by default, overridable per component: stock postgres, nginx and the ASP.NET
+# runtime images do not all run as 65532, and a chart that cannot express that produces
+# CrashLoopBackOff on first contact with a real image.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault

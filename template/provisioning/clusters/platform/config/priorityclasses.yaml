@@ -1,0 +1,41 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+
+# Cluster-scoped, so they live in the platform layer rather than the per-service chart.
+#
+# These decide who survives memory pressure. Without them every workload sits at the
+# same oom_score and the kernel picks arbitrarily — which would put a rocket-alert
+# listener in the same bucket as a throwaway batch job.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: orbit-platform
+value: 100000
+globalDefault: false
+description: "Argo, Traefik, cert-manager, monitoring. Must outlive every app — the thing that reports a problem cannot be the thing evicted by it."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: orbit-interactive
+value: 1000
+globalDefault: false
+description: "A person is waiting on this request."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: orbit-background
+value: 500
+globalDefault: false
+description: "Daemons and exporters. Should not compete, should not be first to die."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: orbit-batch
+value: 100
+globalDefault: false
+description: "Nobody is waiting. Elastic by design: soaks up idle capacity, first to be evicted under pressure."

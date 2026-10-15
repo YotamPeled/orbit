@@ -1,0 +1,226 @@
+[
+  {
+    "apiVersion": "v1",
+    "kind": "Namespace",
+    "metadata": {
+      "name": "proj-a-env-x",
+      "uid": "00000000-0000-0000-0000-000000000001",
+      "resourceVersion": "1",
+      "creationTimestamp": "2026-01-01T00:00:00Z",
+      "labels": {
+        "kubernetes.io/metadata.name": "proj-a-env-x",
+        "orbit.local/project": "proj-a",
+        "orbit.local/env": "env-x"
+      },
+      "annotations": {
+        "argocd.argoproj.io/tracking-id": "services:/Namespace:argocd/proj-a-env-x"
+      },
+      "managedFields": [
+        {
+          "manager": "argocd-controller",
+          "operation": "Update",
+          "apiVersion": "v1",
+          "time": "2026-01-01T00:00:00Z",
+          "fieldsType": "FieldsV1",
+          "fieldsV1": {
+            "f:metadata": {
+              "f:labels": {
+                ".": {},
+                "f:orbit.local/env": {},
+                "f:orbit.local/project": {}
+              }
+            }
+          }
+        }
+      ]
+    },
+    "spec": {
+      "finalizers": ["kubernetes"]
+    },
+    "status": {
+      "phase": "Active"
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "ResourceQuota",
+    "metadata": {
+      "name": "orbit-quota",
+      "namespace": "proj-a-env-x",
+      "uid": "00000000-0000-0000-0000-000000000002",
+      "resourceVersion": "2",
+      "creationTimestamp": "2026-01-01T00:00:00Z",
+      "annotations": {
+        "argocd.argoproj.io/tracking-id": "services:/ResourceQuota:proj-a-env-x/orbit-quota"
+      },
+      "managedFields": [
+        {
+          "manager": "argocd-controller",
+          "operation": "Update",
+          "apiVersion": "v1",
+          "time": "2026-01-01T00:00:00Z",
+          "fieldsType": "FieldsV1",
+          "fieldsV1": {"f:spec": {"f:hard": {}}}
+        }
+      ]
+    },
+    "spec": {
+      "hard": {
+        "pods": "6",
+        "requests.cpu": "500m"
+      }
+    },
+    "status": {
+      "hard": {
+        "pods": "6",
+        "requests.cpu": "500m"
+      },
+      "used": {
+        "pods": "0"
+      }
+    }
+  },
+  {
+    "apiVersion": "opentelemetry.io/v1alpha1",
+    "kind": "Instrumentation",
+    "metadata": {
+      "name": "orbit",
+      "namespace": "proj-a-env-x",
+      "uid": "00000000-0000-0000-0000-000000000004",
+      "resourceVersion": "4",
+      "generation": 1,
+      "creationTimestamp": "2026-01-01T00:00:00Z",
+      "annotations": {
+        "argocd.argoproj.io/tracking-id": "services:opentelemetry.io/Instrumentation:proj-a-env-x/orbit",
+        "instrumentation.opentelemetry.io/default-auto-instrumentation-apache-httpd-image": "example.invalid/otel-apache-httpd:1",
+        "instrumentation.opentelemetry.io/default-auto-instrumentation-dotnet-image": "example.invalid/otel-dotnet:1",
+        "instrumentation.opentelemetry.io/default-auto-instrumentation-go-image": "example.invalid/otel-go:1",
+        "instrumentation.opentelemetry.io/default-auto-instrumentation-java-image": "example.invalid/otel-java:1",
+        "instrumentation.opentelemetry.io/default-auto-instrumentation-nginx-image": "example.invalid/otel-nginx:1",
+        "instrumentation.opentelemetry.io/default-auto-instrumentation-nodejs-image": "example.invalid/otel-nodejs:1",
+        "instrumentation.opentelemetry.io/default-auto-instrumentation-python-image": "example.invalid/otel-python:1"
+      },
+      "managedFields": [
+        {
+          "manager": "argocd-controller",
+          "operation": "Update",
+          "apiVersion": "opentelemetry.io/v1alpha1",
+          "time": "2026-01-01T00:00:00Z",
+          "fieldsType": "FieldsV1",
+          "fieldsV1": {"f:spec": {".": {}}}
+        }
+      ]
+    },
+    "spec": {
+      "exporter": {
+        "endpoint": "http://tempo.tempo.svc:4318"
+      },
+      "python": {
+        "image": "example.invalid/otel-python:1"
+      },
+      "apacheHttpd": {
+        "configPath": "/usr/local/apache2/conf",
+        "version": "2.4"
+      }
+    },
+    "status": {
+      "conditions": [
+        {"type": "Ready", "status": "True"}
+      ]
+    }
+  },
+  {
+    "apiVersion": "networking.k8s.io/v1",
+    "kind": "NetworkPolicy",
+    "metadata": {
+      "name": "default-deny-ingress",
+      "namespace": "proj-a-env-x",
+      "uid": "00000000-0000-0000-0000-000000000005",
+      "resourceVersion": "5",
+      "generation": 1,
+      "creationTimestamp": "2026-01-01T00:00:00Z",
+      "annotations": {
+        "argocd.argoproj.io/tracking-id": "services:networking.k8s.io/NetworkPolicy:proj-a-env-x/default-deny-ingress"
+      },
+      "managedFields": [
+        {
+          "manager": "argocd-controller",
+          "operation": "Update",
+          "apiVersion": "networking.k8s.io/v1",
+          "time": "2026-01-01T00:00:00Z",
+          "fieldsType": "FieldsV1",
+          "fieldsV1": {"f:spec": {".": {}}}
+        }
+      ]
+    },
+    "spec": {
+      "podSelector": {},
+      "policyTypes": ["Ingress"]
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "ConfigMap",
+    "metadata": {
+      "name": "grafana-dashboard-red-proj-a-env-x",
+      "namespace": "monitoring",
+      "uid": "00000000-0000-0000-0000-000000000006",
+      "resourceVersion": "6",
+      "creationTimestamp": "2026-01-01T00:00:00Z",
+      "labels": {
+        "grafana_dashboard": "1"
+      },
+      "annotations": {
+        "argocd.argoproj.io/tracking-id": "services:/ConfigMap:monitoring/grafana-dashboard-red-proj-a-env-x"
+      },
+      "managedFields": [
+        {
+          "manager": "argocd-controller",
+          "operation": "Update",
+          "apiVersion": "v1",
+          "time": "2026-01-01T00:00:00Z",
+          "fieldsType": "FieldsV1",
+          "fieldsV1": {"f:data": {".": {}}}
+        }
+      ]
+    },
+    "data": {
+      "red-proj-a-env-x.json": "{}"
+    }
+  },
+  {
+    "apiVersion": "monitoring.coreos.com/v1",
+    "kind": "Probe",
+    "metadata": {
+      "name": "tenant-probe-ax",
+      "namespace": "monitoring",
+      "uid": "00000000-0000-0000-0000-000000000007",
+      "resourceVersion": "7",
+      "generation": 1,
+      "creationTimestamp": "2026-01-01T00:00:00Z",
+      "labels": {
+        "orbit.local/project": "proj-a",
+        "orbit.local/env": "env-x"
+      },
+      "annotations": {
+        "argocd.argoproj.io/tracking-id": "services:monitoring.coreos.com/Probe:monitoring/tenant-probe-ax"
+      },
+      "managedFields": [
+        {
+          "manager": "argocd-controller",
+          "operation": "Update",
+          "apiVersion": "monitoring.coreos.com/v1",
+          "time": "2026-01-01T00:00:00Z",
+          "fieldsType": "FieldsV1",
+          "fieldsV1": {"f:spec": {".": {}}}
+        }
+      ]
+    },
+    "spec": {
+      "module": "http_2xx",
+      "prober": {
+        "path": "/probe"
+      }
+    }
+  }
+]

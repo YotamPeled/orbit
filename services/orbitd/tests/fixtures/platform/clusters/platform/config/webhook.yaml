@@ -1,0 +1,20 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: chart-a-webhook
+  annotations:
+    cert-manager.io/inject-ca-from: proj-a/chart-a-webhook
+webhooks:
+  - name: widgets.example.io
+    clientConfig:
+      service:
+        name: webhook
+        namespace: proj-a
+        path: /validate
+    rules:
+      - apiGroups: ["example.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["widgets"]
+    admissionReviewVersions: ["v1"]
+    sideEffects: None

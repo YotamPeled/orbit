@@ -1,0 +1,154 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# The intake's PUBLIC webhook door — the one place the agent plane is reachable from the
+# internet, and the only Ingress that may ever exist in orbit-agents-prod.
+#
+# WHY THIS IS HAND-WRITTEN. The generator renders a `github` trigger's intake ROUTE and
+# never the DOOR: it emits no Ingress and no Certificate for the intake on purpose, because
+# the router holds every warm agent's caller bearer and can create Jobs in the namespace
+# that mounts the subscription token — it must not become publicly reachable because a
+# catalog line said so. Opening it is a deliberate act, written out here, and asserted
+# instance-side by scripts/verify/stage6.sh. instance/config.yaml declares
+# `intakeIngress: wired`, which is what lets the generator render a `github` trigger at all
+# (orbit-core scripts/catalog-sync.py; docs/AGENT-PLANE.md, "the `github` gate").
+#
+# WHY IT IS PATH-SCOPED, and why that is the whole security property. The intake's only
+# unauthenticated routes are `GET /healthz` (liveness) and `GET /metrics` (dispatch
+# counters). Everything else is authenticated before it is parsed — the GitHub path is
+# HMAC-SHA256 over the RAW body, verified before any JSON is touched, and it fails CLOSED
+# with a 503 while INTAKE_GITHUB_SECRET is unset. So a `path: /` rule here would publish
+# the two unauthenticated routes and nothing else would notice. The rule below publishes
+# `/webhook/github` and nothing else; Traefik answers 404 for every other path on this host
+# because no router matches it.
+#
+# WHAT KEEPS A TRAVERSAL OUT IS LAYERED, and the PRIMARY control is in the intake, not in
+# Traefik. The intake's backend dispatch is an EXACT literal-string table: do_POST compares
+# `self.path.split("?")[0]` against `/webhook/github` (and the other exact keys) and do_GET
+# against `/healthz`/`/metrics`, and python http.server does NO percent-decoding and NO
+# dot-segment collapsing — so a request that reaches the pod as `/webhook/github/../metrics`
+# is matched as that literal string, hits no key, and is a 404 from the handler. That control
+# is version-independent and is the one that must hold.
+#
+# Traefik's path normalisation is DEFENCE-IN-DEPTH on top of it. Checked rather than assumed
+# (2026-08-30, measured against this cluster's Traefik on an existing path-scoped host):
+# Traefik NORMALISES the request path — dot segments and percent-encoded dot segments alike —
+# BEFORE matching a router, so `/webhook/github/../metrics` is normalised to `/metrics`,
+# matches no router on this host, and is refused at the edge; it never reaches the pod. But
+# that is a VERSION-DEPENDENT default a Traefik chart bump could flip — which is exactly why
+# it is the second layer and the intake's literal dispatch is the first.
+#
+# WHY THERE IS NO `tls:` BLOCK AND NO Certificate. Traefik's TLSStore/default serves
+# wildcard-{{domains.primaryDashed}}-tls
+# (SANs {{domains.primary}}, *.{{domains.primary}}, *.{{domains.dev}}) by SNI for any host
+# with no per-Ingress certificate, and DNS is a Cloudflare wildcard *.{{domains.primary}} -> the node,
+# so this hostname already resolves and already has a valid certificate. An Ingress can in
+# any case only name a Secret in its OWN namespace (the argocd ingress learned this the
+# loud way), so a tls block here would demand a copy of the wildcard key inside the agent
+# plane's namespace — the last namespace in the cluster that should hold one.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: orbit-intake-github
+  namespace: orbit-agents-prod
+  annotations:
+    # THE OOM GUARD for the public door (the attack reviews' blocker). The intake reads a 1MB
+    # body BEFORE it authenticates, on a 256Mi single-replica pod that is ALSO the
+    # Alertmanager->agent router — so an unauthenticated flood at /webhook/github could OOM it
+    # with no edge cap. This attaches the `orbit-intake-github-guard` CHAIN in front of the
+    # router: inFlightReq (concurrency cap, the load-bearing OOM line) + rateLimit + ipAllowList.
+    # Format is <namespace>-<name>@kubernetescrd, matching the basic-auth precedent in
+    # charts/service/templates/ingress.yaml. If this middleware is missing or invalid Traefik
+    # DISABLES the router (answers 404) — stage6 catches that live, and also asserts this
+    # annotation stays attached, references EXACTLY this chain, and that nothing in the chain
+    # is a path-rewriter (a stripPrefix/replacePath could peel /webhook/github and put /metrics
+    # back on the internet).
+    traefik.ingress.kubernetes.io/router.middlewares: orbit-agents-prod-orbit-intake-github-guard@kubernetescrd
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: intake.{{domains.primary}}
+      http:
+        paths:
+          # Prefix, not Exact, deliberately: Prefix is the shape every other Ingress on this
+          # cluster uses and is what Traefik has been observed to honour here. It matches
+          # `/webhook/github` and `/webhook/github/<anything>` — and the intake answers 404
+          # to every one of those sub-paths (its POST dispatch table is an exact-match on
+          # `/webhook/github`), so the extra surface is the same 404 handler the door itself
+          # must expose anyway. What Prefix does NOT match is `/healthz`, `/metrics`, `/`, or
+          # anything else on this host: those have no router and die at Traefik.
+          - path: /webhook/github
+            pathType: Prefix
+            backend:
+              service:
+                name: orbit-agents-intake
+                port: {name: http}
+---
+# THE EDGE OOM DEFENCE for the door, as ONE middleware attached to the router (the basic-auth
+# precedent attaches one; Traefik REFUSES a Middleware object that sets more than one type —
+# "multi-types middleware not supported" — so the three controls are three objects bundled by
+# a `chain`, which is the idiomatic way and is still one attachment). Chain order is
+# outermost-first: inFlightReq runs BEFORE ipAllowList so the concurrency cap counts EVERY
+# request and holds the OOM line even if ipAllowList is ever rotated out — inFlightReq +
+# rateLimit are the load-bearing layer that must always hold; ipAllowList is the extra layer.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: orbit-intake-github-guard
+  namespace: orbit-agents-prod
+spec:
+  chain:
+    middlewares:
+      - name: orbit-intake-github-inflight
+      - name: orbit-intake-github-ratelimit
+      - name: orbit-intake-github-ipallowlist
+---
+# LOAD-BEARING #1 — a hard cap on concurrent in-flight requests at the edge. The intake reads
+# up to 1MB per request into memory BEFORE auth on a 256Mi pod; the app's own post-auth
+# MAX_INFLIGHT=8 does not bound the PRE-auth body read, this does. 16 concurrent * ~1MB is a
+# bounded worst case well under 256Mi. This is the control that survives ipAllowList being
+# gone, so it is first in the chain and always present.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: orbit-intake-github-inflight
+  namespace: orbit-agents-prod
+spec:
+  inFlightReq:
+    amount: 16
+---
+# LOAD-BEARING #2 — a sustained-rate cap (per source IP, Traefik's default extractor). GitHub
+# webhook delivery is low-volume; this is generous for real traffic but caps a flood that
+# stays under the inFlightReq ceiling by trickling. Always present alongside inFlightReq.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: orbit-intake-github-ratelimit
+  namespace: orbit-agents-prod
+spec:
+  rateLimit:
+    average: 50
+    burst: 100
+    period: 1s
+---
+# ADDITIONAL LAYER — restrict the source to GitHub's own published webhook egress ranges.
+# Source: https://api.github.com/meta (the `.hooks` array), fetched 2026-08-30.
+# MAINTENANCE: GitHub rotates these ranges occasionally. If they change and this list is not
+# updated, the effect is "GitHub webhooks blocked" — a VISIBLE outage (the live stage6 POST row
+# goes RED, and deliveries fail at the edge), NOT a security hole: inFlightReq + rateLimit above
+# still hold the OOM line regardless. Re-fetch the .hooks array and update sourceRange to fix.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: orbit-intake-github-ipallowlist
+  namespace: orbit-agents-prod
+spec:
+  ipAllowList:
+    sourceRange:
+      - 192.30.252.0/22
+      - 185.199.108.0/22
+      - 140.82.112.0/20
+      - 143.55.64.0/20
+      - 2a0a:a440::/29
+      - 2606:50c0::/32

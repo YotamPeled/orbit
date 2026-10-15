@@ -1,0 +1,150 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# orbitd: the control surface (source: orbit-core services/orbitd). One replica on
+# purpose — the PVC is ReadWriteOnce and the signing key lives on it. Recreate keeps
+# rollout writers singular. Host is orbit.<primary> and mcp.<primary>: phase 8 moved
+# the mcp record the deleted agentgateway held onto orbitd, which is the MCP server now.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orbitd
+  namespace: orbit
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: orbitd}
+  template:
+    metadata:
+      labels: {app: orbitd}
+    spec:
+      serviceAccountName: orbitd
+      # The kube client needs this SA's projected token; nothing else is auto-mounted.
+      automountServiceAccountToken: true
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: orbitd
+          # Pinned by hand until the control surface is old enough to deserve
+          # catalog-managed tags; the image is a CORE artifact, built by orbit-core's
+          # own build (on its operator machine) and published under the CORE repo's owner — hence coreRegistry in
+          # instance/config.yaml.
+          image: {{coreRegistry.owner}}/orbitd:{{coreRegistry.orbitdTag}}
+          ports:
+            - {containerPort: 8080, name: http}
+          env:
+            - {name: ORBITD_MCP_URL, value: https://orbit.{{domains.primary}}/mcp}
+            # Both hosts this Ingress routes (orbit.<primary> beside the mcp record
+            # phase 8 moved here), and both https origins — otherwise every MCP
+            # request on the mcp host is a 421. The canonical URL above stays on
+            # orbit.<primary>: it is the token audience and must not move.
+            - {name: ORBITD_ALLOWED_HOSTS, value: "orbit.{{domains.primary}},mcp.{{domains.primary}}"}
+            - {name: ORBITD_ALLOWED_ORIGINS, value: "https://orbit.{{domains.primary}},https://mcp.{{domains.primary}}"}
+            - {name: ORBITD_SIGNING_KEY, value: /var/lib/orbitd/signing-key.pem}
+            - {name: ORBITD_PRINCIPALS, value: /var/lib/orbitd/principals.json}
+            - {name: ORBITD_REVOCATIONS, value: /var/lib/orbitd/revocations}
+            - {name: ORBITD_INSTANCE_DIR, value: /var/lib/instance/current}
+            - {name: ORBITD_PROMETHEUS_URL, value: "http://kube-prometheus-stack-prometheus.monitoring.svc:9090"}
+            - {name: ORBITD_LOKI_URL, value: "http://loki.loki.svc:3100"}
+            - {name: ORBITD_TEMPO_URL, value: "http://tempo.tempo.svc:3200"}
+            - {name: ORBITD_ALERTMANAGER_URL, value: "http://kube-prometheus-stack-alertmanager.monitoring.svc:9093"}
+            # The Bearer [REDACTED] verifies Alertmanager's monitor-transition POSTs
+            # against: the FILE form, so the credential never touches the rendered
+            # manifest. Provisioned by a later change; `optional` on the volume
+            # below keeps orbitd starting before it exists (the route answers 401).
+            - {name: ORBITD_ALERT_WEBHOOK_TOKEN_FILE, value: /etc/orbit-alert-webhook/token}
+            - {name: ORBITD_APPLY, value: "{{orbitd.applyMode}}"}
+            - {name: ORBITD_RECONCILE_PERIOD_S, value: "{{orbitd.reconcilePeriodS}}"}
+            - {name: ORBITD_APPLY_PAIRS, value: "{{orbitd.applyPairs}}"}
+            - {name: ORBIT_CONFIG_DIR, value: /etc/github-app}
+            - {name: ORBIT_REGISTRY_TOKEN_FILE, value: /etc/registry/ghcr-pull-token}
+            - {name: ORBIT_INSTANCE_CONFIG, value: /var/lib/instance/current/instance/config.yaml}
+            - {name: ORBIT_ACTOR, value: orbitd}
+            # What a converge Job is built from (orbitd/features_job.py): this same
+            # image, the checkout image, and the instance repo, pinned to one commit.
+            - {name: ORBITD_IMAGE, value: "{{coreRegistry.owner}}/orbitd:{{coreRegistry.orbitdTag}}"}
+            # The desk image of the same release: the Jobs that back up or restore a
+            # database and remove a project run core's own scripts from it.
+            - {name: ORBITD_DESK_IMAGE, value: "{{coreRegistry.owner}}/orbit-desk:{{coreRegistry.orbitdTag}}"}
+            - {name: ORBITD_GIT_SYNC_IMAGE, value: "registry.k8s.io/git-sync/git-sync:v4.7.1"}
+            - {name: ORBITD_INSTANCE_REPO, value: "https://github.com/{{git.repoSlug}}.git"}
+            - {name: TMPDIR, value: /scratch}
+          volumeMounts:
+            - {name: state, mountPath: /var/lib/orbitd}
+            - {name: instance, mountPath: /var/lib/instance, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+            - {name: github-app, mountPath: /etc/github-app, readOnly: true}
+            - {name: registry, mountPath: /etc/registry, readOnly: true}
+            - {name: alert-webhook, mountPath: /etc/orbit-alert-webhook, readOnly: true}
+            - {name: scratch, mountPath: /scratch}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+          resources:
+            requests: {cpu: 10m, memory: 128Mi}
+            limits: {memory: 192Mi}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+        # Desired state is the instance git repo. git-sync authenticates as the GitHub App
+        # (the same prod-store keys the desk's ship uses) and keeps a full-history checkout
+        # of main (full history: the deploy ledger is git log of the tags file); orbitd reads it at ORBITD_INSTANCE_DIR. IDs use git-sync's env form
+        # (values are not known at render); the private key is the file form.
+        - name: git-sync
+          image: registry.k8s.io/git-sync/git-sync:v4.7.1
+          args:
+            - --repo=https://github.com/{{git.repoSlug}}.git
+            - --ref=main
+            - --period=60s
+            - --depth=0
+            - --root=/var/lib/instance
+            - --link=current
+            - --github-app-private-key-file=/etc/github-app/private-key.pem
+          env:
+            - name: GITSYNC_GITHUB_APP_APPLICATION_ID
+              valueFrom: {secretKeyRef: {name: orbitd-github-app, key: app-id}}
+            - name: GITSYNC_GITHUB_APP_INSTALLATION_ID
+              valueFrom: {secretKeyRef: {name: orbitd-github-app, key: installation-id}}
+          volumeMounts:
+            - {name: instance, mountPath: /var/lib/instance}
+            - {name: github-app, mountPath: /etc/github-app, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+      imagePullSecrets:
+        - name: ghcr-pull
+      volumes:
+        - name: state
+          persistentVolumeClaim: {claimName: orbitd}
+        - name: tmp
+          emptyDir: {sizeLimit: 8Mi}
+        - name: instance
+          emptyDir: {}
+        - name: github-app
+          secret: {secretName: orbitd-github-app}
+        - name: registry
+          secret: {secretName: orbitd-registry}
+        # The Alertmanager webhook bearer. `optional: true` is load-bearing: the
+        # Secret is provisioned by a later change, and a required mount of an
+        # absent Secret would wedge the pod in ContainerCreating over a token.
+        - name: alert-webhook
+          secret: {secretName: orbit-alert-webhook, optional: true}
+        - name: scratch
+          emptyDir: {sizeLimit: 256Mi}

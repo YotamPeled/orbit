@@ -1,0 +1,243 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# Read-only cluster reach for phase-3 tools, plus a second ClusterRole that can
+# patch apps/deployments (rollout restart). Nothing else writes; the kube client
+# in the pod needs the projected ServiceAccount token, and that is the only token
+# this identity gets. The code guards namespaces.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orbitd
+  namespace: orbit
+# The in-cluster kube client authenticates with this SA's projected token. Nothing
+# else is auto-mounted.
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: orbitd-readonly
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/log, events, namespaces, resourcequotas, nodes, services, serviceaccounts, persistentvolumeclaims, configmaps]
+    verbs: [get, list, watch]
+  # statefulsets and daemonsets: the features status reads whether a feature's own
+  # workloads (Loki, Tempo, Alloy) are ready
+  - apiGroups: [apps]
+    resources: [deployments, replicasets, statefulsets, daemonsets]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [cronjobs, jobs]
+    verbs: [get, list, watch]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [roles, rolebindings]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses, networkpolicies]
+    verbs: [get, list, watch]
+  - apiGroups: [cert-manager.io]
+    resources: [certificates]
+    verbs: [get, list, watch]
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [clusters, scheduledbackups, objectstores]
+    verbs: [get, list, watch]
+  - apiGroups: [barmancloud.cnpg.io]
+    resources: [objectstores]
+    verbs: [get, list, watch]
+  - apiGroups: [monitoring.coreos.com]
+    resources: [prometheusrules, probes, servicemonitors]
+    verbs: [get, list, watch]
+  - apiGroups: [metrics.k8s.io]
+    resources: [pods, nodes]
+    verbs: [get, list, watch]
+  - apiGroups: [traefik.io]
+    resources: [middlewares]
+    verbs: [get, list, watch]
+  - apiGroups: [opentelemetry.io]
+    resources: [instrumentations]
+    verbs: [get, list, watch]
+  # Sealed secrets, as the operator's own objects (ciphertext): the features status says
+  # whether the secret a feature needs is applied. Never the Secrets they render.
+  - apiGroups: [isindir.github.com]
+    resources: [sopssecrets]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: orbitd-readonly
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: orbitd-readonly
+subjects:
+  - kind: ServiceAccount
+    name: orbitd
+    namespace: orbit
+---
+# Rollout restart is a strategic-merge patch on the deployment. Namespaces are
+# guarded in code; this role is cluster-scoped because a Role per env namespace
+# would have to be kept in step with the catalog.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: orbitd-operate
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: orbitd-operate
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: orbitd-operate
+subjects:
+  - kind: ServiceAccount
+    name: orbitd
+    namespace: orbit
+---
+# The applier (PHASE5-DESIGN §2): server-side apply and prune of the rendered tenant
+# set. The rows mirror APPLIED_KINDS in services/orbitd/orbitd/applier.py minus
+# configmaps, and its test holds the two together: no RBAC kinds, no Secrets (those
+# arrive sealed from the sops plane), and no cluster-wide ConfigMap writes. Cluster-scoped
+# because the applier creates catalog-derived namespaces; the code guards the
+# namespace per pair. ConfigMap verbs are granted only by namespaced Roles: the three
+# below (inventory in `orbit`, dashboards in `monitoring`, the monitors' shared Loki
+# ruler ConfigMap in `loki`) and the generator's orbit-applier-configmaps Role in every
+# tenant namespace (clusters/apps/namespaces.yaml).
+# Everything stays inert until ORBITD_APPLY is set.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: orbitd-applier
+rules:
+  - apiGroups: [""]
+    resources: [namespaces, serviceaccounts, resourcequotas, persistentvolumeclaims, services]
+    verbs: [create, patch, delete]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [create, patch, delete]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [create, patch, delete]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies, ingresses]
+    verbs: [create, patch, delete]
+  - apiGroups: [traefik.io]
+    resources: [middlewares]
+    verbs: [create, patch, delete]
+  - apiGroups: [cert-manager.io]
+    resources: [certificates]
+    verbs: [create, patch, delete]
+  - apiGroups: [opentelemetry.io]
+    resources: [instrumentations]
+    verbs: [create, patch, delete]
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [clusters, scheduledbackups]
+    verbs: [create, patch, delete]
+  - apiGroups: [barmancloud.cnpg.io]
+    resources: [objectstores]
+    verbs: [create, patch, delete]
+  - apiGroups: [monitoring.coreos.com]
+    resources: [servicemonitors, probes, prometheusrules]
+    verbs: [create, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: orbitd-applier
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: orbitd-applier
+subjects:
+  - kind: ServiceAccount
+    name: orbitd
+    namespace: orbit
+---
+# The inventory ConfigMap (orbit-inventory-<project>-<env>) lives in `orbit`; the
+# applier reads and writes it, never deletes it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orbitd-applier-inventory
+  namespace: orbit
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orbitd-applier-inventory
+  namespace: orbit
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: orbitd-applier-inventory
+subjects:
+  - kind: ServiceAccount
+    name: orbitd
+    namespace: orbit
+---
+# The generator's dashboard ConfigMaps land in `monitoring`; the applier writes and
+# prunes them there and nowhere else outside the tenant namespaces.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orbitd-applier-dashboards
+  namespace: monitoring
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orbitd-applier-dashboards
+  namespace: monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: orbitd-applier-dashboards
+subjects:
+  - kind: ServiceAccount
+    name: orbitd
+    namespace: orbit
+# orbit:feature logs
+---
+# The monitors' shared Loki ruler ConfigMap (`orbit-monitors-logs`) lives in `loki`;
+# orbitd renders log monitors into it and prunes it, and writes nothing else there.
+# Read verbs come from the readonly ClusterRole above; this Role adds only the writes.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orbitd-monitors-logs
+  namespace: loki
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orbitd-monitors-logs
+  namespace: loki
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: orbitd-monitors-logs
+subjects:
+  - kind: ServiceAccount
+    name: orbitd
+    namespace: orbit
+# orbit:end logs

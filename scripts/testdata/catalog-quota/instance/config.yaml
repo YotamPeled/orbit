@@ -1,0 +1,10 @@
+instance: {name: fixture}
+git:
+  repoUrl: git@github.com:example/test.git
+  branch: main
+  github_org: example
+domains:
+  primary: example.org
+  dev: dev.example.org
+  dnsZones: [example.org]
+registry: ghcr.io/example

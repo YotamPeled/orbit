@@ -1,0 +1,303 @@
+{{- with .Values.database }}
+{{- $root := $ -}}
+{{- $name := printf "%s-db" $root.Values.project -}}
+{{- $image := .image | default "ghcr.io/cloudnative-pg/postgresql:17.9-standard-trixie" -}}
+{{- /*
+A database is declared, never configured. The catalog says a project needs Postgres and
+how much disk; everything else — the user, the password, the connection details — is
+produced by CloudNativePG into a Secret it owns. No database credential is ever chosen by
+a person, so there is none to leak, rotate by hand, or commit.
+
+The image is pinned rather than inherited from the operator. An operator upgrade that
+changes the default major version would start a newer Postgres against an older data
+directory, which does not migrate — it refuses to boot, after the upgrade has already
+happened.
+
+The backup job below reuses this exact image on purpose: pg_dump refuses to dump a server
+newer than itself, so pinning one image for both makes that mismatch unrepresentable.
+*/ -}}
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ $name }}
+  labels:
+    app.kubernetes.io/instance: {{ $root.Values.project }}
+    orbit.local/env: {{ $root.Values.env }}
+spec:
+  instances: 1
+  imageName: {{ $image }}
+  bootstrap:
+    initdb:
+      database: {{ $root.Values.project }}
+      owner: {{ $root.Values.project }}
+  # No superuser secret. Nothing needs one, and an unused credential is only ever a
+  # credential to steal.
+  enableSuperuserAccess: false
+  primaryUpdateStrategy: unsupervised
+  storage:
+    size: {{ .size | default "2Gi" }}
+    storageClass: {{ $root.Values.storageClassName }}
+  {{- /*
+  Resources are mandatory here, not a tuning knob. Every project namespace carries a
+  ResourceQuota naming requests.cpu, requests.memory and limits.memory — and a quota that
+  names a resource makes it compulsory for every pod in the namespace. A Cluster with no
+  resources block is admitted by the operator and then rejected pod-by-pod by the quota,
+  which surfaces as a Cluster stuck with zero instances and nothing wrong in its status.
+  */}}
+  resources:
+    requests:
+      cpu: {{ .cpu | default "100m" }}
+      memory: {{ .memory | default "256Mi" }}
+    limits:
+      memory: {{ .memory | default "256Mi" }}
+  {{- if .parameters }}
+  {{- range $k, $_ := .parameters }}
+  {{- if not (regexMatch "^[a-z_]+$" (toString $k)) }}
+  {{- fail (printf "at '/database/parameters': additional properties '%s' not allowed" $k) }}
+  {{- end }}
+  {{- end }}
+  postgresql:
+    parameters:
+      {{- range $k, $v := .parameters }}
+      {{ $k }}: {{ $v | quote }}
+      {{- end }}
+  {{- end }}
+  {{- if $root.Values.s3 }}
+  {{- /*
+  Continuous WAL archiving + base backups to the instance's platform bucket — the change
+  the old backup comment promised for "when something in this cluster is worth a bucket".
+  The generator sets `s3` only for PROD databases: dev data is disposable by design (a
+  fresh dev database is one refresh job away) and archiving it would demand the bucket
+  credential in the dev store for nothing.
+
+  Via the barman-cloud PLUGIN (the ObjectStore below), not the operator's in-tree
+  barmanObjectStore: the in-tree path execs barman-cloud binaries inside the Postgres
+  image, and the current -standard- image generation does not ship them — the in-tree
+  config renders clean, reports ContinuousArchiving=True, and archives nothing. Found
+  by execution on 2026-08-27; the plugin sidecar carries its own binaries.
+  */}}
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      # `enabled: true` is the CRD default written out — the API server persists it
+      # either way, and omitting it leaves Argo permanently OutOfSync with no diff a
+      # sync can close (same class as the ExternalSecret conversion trio).
+      enabled: true
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: {{ $name }}-store
+  {{- end }}
+  {{- /*
+  Every database is scraped. The PodMonitor feeds OrbitDatabaseDown (cnpg_collector_up),
+  the dashboard's "Database backends" panel and, where archiving is on, the alert that
+  catches archiving failing silently (cnpg_pg_stat_archiver_*: un-archived WAL fills the
+  volume until Postgres stops). It used to be enabled only with archiving, so a dev
+  database was never scraped: its panel had no data and its DatabaseDown alert could not
+  fire (docs/V1.md §8). The Prometheus operator is a core platform app on every instance.
+  */}}
+  monitoring:
+    enablePodMonitor: true
+{{- with $root.Values.s3 }}
+---
+{{- /*
+The archive target. The orbit-s3 Secret lives in this namespace because the plugin
+resolves credentials here — but no app pod mounts it and the default ServiceAccount has
+no RBAC to read Secrets, so its presence widens nothing for a compromised workload.
+
+archiveGeneration is the re-arm knob for AFTER a disaster recovery: barman refuses to
+archive into a non-empty path, so a recreated cluster must write under a NEW path
+(gen2, gen3...) or it exits its first real recovery with archiving dead. Bump it in the
+catalog's database block alongside the recovery.
+*/}}
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: {{ $name }}-store
+  labels:
+    app.kubernetes.io/instance: {{ $root.Values.project }}
+    orbit.local/env: {{ $root.Values.env }}
+spec:
+  configuration:
+    destinationPath: {{ printf "s3://%s/cnpg/%s-%s%s" .bucket $root.Values.project $root.Values.env (ternary (printf "/gen%v" $root.Values.database.archiveGeneration) "" (not (empty $root.Values.database.archiveGeneration))) | quote }}
+    endpointURL: {{ .endpoint | quote }}
+    s3Credentials:
+      accessKeyId:
+        name: orbit-s3
+        key: access-key
+      secretAccessKey:
+        name: orbit-s3
+        key: secret-key
+    wal:
+      compression: gzip
+    data:
+      compression: gzip
+  retentionPolicy: {{ .retention | default "7d" | quote }}
+  {{- /*
+  Mandatory for the same reason the Cluster's resources are: the namespace quota names
+  requests/limits, which makes them compulsory for EVERY container — and the plugin
+  injects this sidecar into the database pod. Without this block the operator deletes
+  the old pod and the quota rejects the new one: the database is simply gone, with
+  nothing wrong in the Cluster status. Same policy as everywhere: no CPU limit,
+  memory request == limit.
+
+  192Mi because base backups stream THROUGH this sidecar: at 64Mi it was OOM-killed
+  (exit 137) mid-backup on a 30MB database, surfacing as a bare gRPC EOF on the
+  Backup object. WAL archiving alone fits in far less; the backup path is the sizer.
+  */}}
+  instanceSidecarConfiguration:
+    resources:
+      requests:
+        cpu: 20m
+        memory: 192Mi
+      limits:
+        memory: 192Mi
+{{- end }}
+---
+{{- if $root.Values.s3 }}
+{{- /*
+The nightly base backup that anchors the WAL chain — PITR restores from the newest base
+backup plus archived WAL, so without a fresh base the recovery window drags a week of WAL
+replay behind it. Six-field cron: CNPG schedules include seconds. immediate: true makes
+the FIRST backup happen at creation rather than at tonight's tick, so a fresh deploy is
+restorable the same hour it appears and the verify check has something to assert.
+*/}}
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: {{ $name }}-base
+  labels:
+    app.kubernetes.io/instance: {{ $root.Values.project }}
+    orbit.local/env: {{ $root.Values.env }}
+spec:
+  schedule: "0 30 3 * * *"
+  immediate: true
+  backupOwnerReference: self
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+  cluster:
+    name: {{ $name }}
+---
+{{- end }}
+{{- /*
+The nightly pg_dump to a local volume — the whole backup story for an instance WITHOUT
+a bucket, and only for those: with s3 set, WAL archiving + base backups supersede it,
+and this block does not render. The switch was gated, deliberately, on a demonstrated
+PITR restore from the bucket (a tenant database, 260k rows, exact match, 2026-08-27) —
+pruning
+this block prunes the PVC holding every existing dump, and that is only acceptable
+after the replacement has been proven, not merely deployed.
+
+The dump runs through the same hardened pod spec as every other workload, so it cannot
+quietly become the one pod on the box running as root.
+*/ -}}
+{{- if not $root.Values.s3 }}
+{{- range $root.Values.components }}
+{{- if eq .name "db-backup" }}
+{{- fail (printf "component %q claims the name of the chart's own database backup CronJob (%s-db-backup) — rename the component" .name $root.Values.project) }}
+{{- end }}
+{{- end }}
+{{- $backup := .backup | default dict -}}
+{{- $keep := $backup.keep | default 7 -}}
+{{- $comp := dict
+      "name" "db-backup"
+      "kind" "cron"
+      "class" "batch"
+      "image" $image
+      "memory" ($backup.memory | default "128Mi")
+      "persistence" (dict "size" ($backup.size | default "1Gi") "mountPath" "/backup")
+      "command" (list "/bin/sh" "-ec")
+      "args" (list (printf `umask 077
+# Wait for the server rather than assuming it. This same script runs once per deploy, where
+# Postgres may still be bootstrapping, and a dump job that failed there would report the
+# whole service degraded over a database that is merely young.
+for i in $(seq 1 150); do pg_isready -q && break; sleep 2; done
+pg_isready
+
+out="/backup/${PGDATABASE}-$(date -u +%%Y%%m%%dT%%H%%M%%SZ).sql.gz"
+pg_dump --no-owner --no-privileges | gzip -9 > "$out.part"
+mv "$out.part" "$out"
+# Prune by age, and sweep any .part left behind by a job that died mid-dump — otherwise a
+# failing backup fills the volume with half-written files that the age prune never matches.
+find /backup -name '*.sql.gz' -mtime +%v -delete
+find /backup -name '*.part' -mmin +120 -delete
+ls -lh /backup` $keep))
+      "env" (dict
+        "PGHOST"     (dict "secret" (printf "%s-app" $name) "key" "host")
+        "PGPORT"     (dict "secret" (printf "%s-app" $name) "key" "port")
+        "PGUSER"     (dict "secret" (printf "%s-app" $name) "key" "username")
+        "PGPASSWORD" (dict "secret" (printf "%s-app" $name) "key" "password")
+        "PGDATABASE" (dict "secret" (printf "%s-app" $name) "key" "dbname"))
+-}}
+{{- $ctx := dict "root" $root "comp" $comp }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "service.name" $ctx }}
+  labels: {{- include "service.labels" $ctx | nindent 4 }}
+spec:
+  schedule: {{ $backup.schedule | default "0 3 * * *" | quote }}
+  timeZone: {{ $backup.timeZone | default "Asia/Jerusalem" | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels: {{- include "service.labels" $ctx | nindent 12 }}
+        spec:
+          restartPolicy: OnFailure
+          {{- include "service.podSpec" $ctx | nindent 10 }}
+---
+{{- /*
+One dump per deploy, as an ordinary Job rather than an Argo hook.
+
+Two things make this worth a resource. The backup volume's storage class binds on first
+consumer, so until something mounts it the claim sits Pending — and a Pending claim holds
+the whole Application at Progressing, forever, on a service that is serving traffic
+normally. An Application that only reports Healthy after 03:00 is not a signal anyone can
+act on. The second is that it moves the discovery of a broken backup from the night it is
+needed to the deploy that broke it.
+
+Not a hook, because hooks were not reliable here: as PostSync it deadlocked (a PostSync
+hook waits for health, and the unbound claim was what was withholding health), and as a
+Sync hook Argo silently never created it at all — it appeared in no sync result and no
+event, through a hard refresh and a forced sync.
+
+A Job's pod template is immutable, so the name carries a digest of the spec. A changed
+backup configuration is therefore a different Job that Argo creates and an old one it
+prunes, while an unchanged one is left alone rather than being re-applied and rejected.
+*/ -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  {{- /* The digest must cover EVERYTHING that reaches the immutable pod template, not
+       just the component dict. imagePullSecrets comes from a root-level value; when it
+       was added the template changed under an unchanged name, and every project's sync
+       failed on "field is immutable" at once. */}}
+  name: {{ include "service.name" $ctx }}-{{ printf "%s|pull=%s" ($comp | toYaml) ($.Values.imagePullSecret | default "") | sha256sum | trunc 8 }}
+  labels: {{- include "service.labels" $ctx | nindent 4 }}
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels: {{- include "service.labels" $ctx | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      {{- include "service.podSpec" $ctx | nindent 6 }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "service.name" $ctx }}
+  labels: {{- include "service.labels" $ctx | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ $root.Values.storageClassName }}
+  resources:
+    requests:
+      storage: {{ $backup.size | default "1Gi" }}
+{{- end }}{{- /* end: if not s3 (the pg_dump path) */}}
+{{- end }}

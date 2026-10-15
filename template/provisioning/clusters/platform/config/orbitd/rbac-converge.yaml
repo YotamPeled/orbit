@@ -1,0 +1,53 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+
+# The converge Job (orbitd/features_job.py): `orbit features converge` at one commit of
+# the instance repo, the way the desk runs it. It applies and retires PLATFORM
+# Applications (CRDs, namespaces, cluster roles, webhooks), which is the whole cluster's
+# surface, so it runs under its own ServiceAccount: orbitd's own token stays what it was
+# (the tenant kinds), and holds only the right to start and read these Jobs.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orbit-platform
+  namespace: orbit
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: orbit-platform
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: orbit-platform
+    namespace: orbit
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orbitd-converge-jobs
+  namespace: orbit
+rules:
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [create, get, list, watch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orbitd-converge-jobs
+  namespace: orbit
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: orbitd-converge-jobs
+subjects:
+  - kind: ServiceAccount
+    name: orbitd
+    namespace: orbit

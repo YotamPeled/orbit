@@ -1,0 +1,131 @@
+{{- /*
+Collect web components and fail the render if two of them claim the same path on the
+same host. Kubernetes accepts duplicate paths silently and Traefik then serves whichever
+it likes — an SPA and its API both defaulting to "/" leaves the SPA unreachable with no
+error anywhere. Better to refuse to render.
+*/ -}}
+{{- $webs := list -}}
+{{- range $c := .Values.components -}}
+  {{- if and (eq ($c.kind | default "web") "web") $c.port -}}
+    {{- $webs = append $webs $c -}}
+  {{- end -}}
+{{- end -}}
+
+{{- range $host := .Values.hostnames -}}
+  {{- $seen := dict -}}
+  {{- range $c := $webs -}}
+    {{- if or (not $c.hosts) (has $host $c.hosts) -}}
+      {{- $p := $c.path | default "/" -}}
+      {{- if hasKey $seen $p -}}
+        {{- fail (printf "components %q and %q both claim path %q on host %q — give one of them a distinct path, or bind them to different hosts with `hosts:`" (get $seen $p) $c.name $p $host) -}}
+      {{- end -}}
+      {{- $seen = set $seen $p $c.name -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+
+{{- if and $webs .Values.hostnames }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Values.project }}
+  labels:
+    app.kubernetes.io/instance: {{ .Values.project }}
+    orbit.local/env: {{ .Values.env }}
+  {{- if .Values.protected }}
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-basic-auth@kubernetescrd
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingressClass }}
+  {{- /*
+  Only `managed` groups get a tls entry. An Ingress can reference a TLS Secret only in
+  its OWN namespace, and the platform wildcard lives in the traefik namespace — so
+  naming it here would silently fail TLS for every service.
+  Hosts under the platform's primary domain need no tls block at all: Traefik's TLSStore
+  default already serves the wildcard for any matching SNI. Only custom domains (a
+  tenant's own domain, e.g. example.co.uk) need a Certificate, which cert-manager then
+  issues into this namespace.
+  */ -}}
+  {{- $managed := list }}
+  {{- range .Values.tlsGroups }}{{- if .managed }}{{- $managed = append $managed . }}{{- end }}{{- end }}
+  {{- with $managed }}
+  tls:
+    {{- range . }}
+    - secretName: {{ .secretName }}
+      hosts: {{ toYaml .hosts | nindent 8 }}
+    {{- end }}
+  {{- end }}
+  rules:
+    {{- range $host := .Values.hostnames }}
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          {{- /* `path` is quoted below. Unquoted, `path: "/api #c"` renders as a bare scalar
+               that YAML truncates at the comment, so two components resolved to the SAME
+               live path while the guard above compared raw strings and saw no duplicate.
+               The schema also refuses spaces and '#' outright. */ -}}
+          {{- range $c := $webs }}
+          {{- if or (not $c.hosts) (has $host $c.hosts) }}
+          - path: {{ $c.path | default "/" | quote }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "service.name" (dict "root" $ "comp" $c) }}
+                port:
+                  name: http
+          {{- end }}
+          {{- end }}
+    {{- end }}
+{{- end }}
+
+{{- /*
+Certificates only for hosts the platform does not already cover with its wildcard.
+The generator decides membership; emitting a Certificate for a service with no web
+component would create one that can never be served.
+*/ -}}
+{{- if $webs }}
+{{- range .Values.tlsGroups }}
+{{- if .managed }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ .secretName }}
+  {{- /* Labelled like the Ingress: orbitd deletes an object the render no longer holds
+       only when its live copy carries the pair's labels. Unlabelled, the Certificate of
+       a host that was removed stayed, and cert-manager kept retrying its order. */}}
+  labels:
+    app.kubernetes.io/instance: {{ $.Values.project }}
+    orbit.local/env: {{ $.Values.env }}
+spec:
+  secretName: {{ .secretName }}
+  issuerRef:
+    name: {{ .issuer }}
+    kind: ClusterIssuer
+  dnsNames: {{ toYaml .hosts | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{- if .Values.protected }}
+---
+# Created by the chart, not assumed to exist. Traefik disables a router whose middleware
+# is missing, which turns "protected" into an unrouted 404 — failing open in the sense
+# that matters: the guard silently is not there.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: basic-auth
+  labels:
+    app.kubernetes.io/instance: {{ .Values.project }}
+    orbit.local/env: {{ .Values.env }}
+spec:
+  basicAuth:
+    # The Secret is created by the catalog-generated ExternalSecret dev-basic-auth in
+    # clusters/apps/namespaces.yaml (rendered by scripts/catalog-sync.py: key users from
+    # DEV_BASIC_AUTH_USERS in the environment's Infisical store), never by this chart:
+    # a generated Application is committed in plaintext, so an htpasswd rendered into
+    # its values would put credentials in git.
+    secret: dev-basic-auth
+{{- end }}

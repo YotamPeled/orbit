@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: webhook-tls
+  labels:
+    app.kubernetes.io/instance: classes
+type: kubernetes.io/tls
+data:
+  ca.crt: dGVzdA==
+  ca.key: dGVzdA==
+  tls.crt: dGVzdA==
+  tls.key: dGVzdA==

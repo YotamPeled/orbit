@@ -1,0 +1,26 @@
+# Test catalog for scripts/test_catalog_secrets_plane.py: one project with a declared
+# Secret, a prod database (so the generator appends the bucket credential) and a dev
+# environment (so it renders the basic-auth credential).
+version: 3
+projects:
+  - id: widgets
+    name: Widgets
+    hosted: self
+    database:
+      size: 2Gi
+      memory: 256Mi
+    secrets:
+      - name: widgets-app
+        keys: [WIDGETS_API_TOKEN]
+    environments:
+      prod: {}
+      dev:
+        enabled: true
+    components:
+      - name: web
+        kind: web
+        image: example/web
+        port: 8080
+        path: /
+        env:
+          API_TOKEN: {secret: widgets-app, key: WIDGETS_API_TOKEN}

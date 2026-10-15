@@ -1,0 +1,182 @@
+version: 3
+
+projects: []
+
+# ── a worked project, end to end (read this before writing your first entry) ──────────
+# One web component, one worker, a database, one supplied secret and a custom domain —
+# the shape most first projects have. `orbit-onboard` is the skill that explains WHICH of
+# these to declare and why; this is what the result looks like. Every hostname below is
+# `example.org` standing in for this instance's own primary domain
+# (instance/config.yaml -> domains.primary): `<id>.<primary>` is automatic and is written
+# out here only to show what is being defaulted.
+#
+# projects:
+#   - id: widgets                  # DNS label; the namespace is <id>-<env>
+#     name: Widgets
+#     blurb: One line, for the portfolio card.
+#     repo: example-org/widgets    # the app repo its images are built from. The deploy path checks a
+#                                  # build event against this before bumping a tag, so an
+#                                  # entry without it is a project nothing can deploy.
+#     tags: [python]
+#     hosted: self
+#     # Declared, never configured: this renders a CloudNativePG Cluster and the Secret
+#     # `widgets-db-app` that the components read. No password is chosen by a person, and
+#     # each environment gets its own. Backups follow the INSTANCE, not this entry: with
+#     # no platform bucket, a nightly dump and a dump on every deploy to a local PVC; with
+#     # one, a prod database gets WAL archiving + scheduled base backups instead.
+#     database:
+#       size: 2Gi
+#       memory: 256Mi
+#     # Pointers, never values. The keys are read from the sops-sealed Secret
+#     # (the same names) into a Kubernetes Secret. Every Secret a pod references
+#     # must be declared or the chart refuses to render — a missing one is silent
+#     # at runtime, which is why.
+#     secrets:
+#       - name: widgets-app
+#         keys: [WIDGETS_API_TOKEN]
+#     environments:
+#       prod:
+#         branch: main             # main -> prod, dev -> dev, unless said otherwise here
+#         # Inside a zone Orbit runs DNS for, a custom domain gets DNS-01 and its
+#         # certificate is issued BEFORE traffic moves — which is what makes a cutover a
+#         # DNS change alone, with the old system still standing as the rollback.
+#         # Anywhere else it is HTTP-01 and the domain must already point here.
+#         customDomains:
+#           - {host: widgets.example.com}
+#       dev:
+#         enabled: true            # gives widgets.dev.example.org, basic-auth protected
+#         branch: dev              # (a dev URL is a public URL)
+#     components:
+#       - name: web
+#         kind: web                # Deployment + Service + Ingress path
+#         class: interactive       # a person is waiting on the response
+#         language: python         # turns on OTel SDK injection; no app change
+#         image: ghcr.io/example-org/widgets-web    # no tag: the ship writes catalog/tags.yaml
+#         port: 8080
+#         path: /                  # two web components may not share a path. EVERYTHING the
+#                                  # component serves under this path is public on its
+#                                  # hostname in prod, /metrics and its health checks
+#                                  # included (dev asks for the basic-auth credentials).
+#                                  # A component that must keep them private serves its
+#                                  # metrics on another port (`metrics: {port: ...}` is
+#                                  # scraped inside the cluster) or sits under a narrower
+#                                  # path (`path: /api`).
+#         memory: 256Mi            # request AND limit; size it to observed usage
+#         probePath: /healthz      # must not depend on the database
+#         readinessPath: /readyz  # optional: readiness uses this, liveness keeps probePath
+#         readOnlyRootFilesystem: true   # needs scratch below for anything it must write
+#         scratch: {mountPath: /tmp/scratch, sizeLimit: 512Mi}   # memory-backed, writable
+#         metrics: {port: 8080}    # renders a ServiceMonitor
+#         env:                     # a literal, or a pointer into a Kubernetes Secret
+#           PGHOST:     {secret: widgets-db-app, key: host}
+#           PGPORT:     {secret: widgets-db-app, key: port}
+#           PGUSER:     {secret: widgets-db-app, key: username}
+#           PGPASSWORD: {secret: widgets-db-app, key: password}
+#           PGDATABASE: {secret: widgets-db-app, key: dbname}
+#           API_TOKEN:  {secret: widgets-app, key: WIDGETS_API_TOKEN}
+#       - name: importer
+#         kind: worker             # Deployment only, no inbound traffic
+#         class: batch             # nobody is waiting; it still takes every idle core
+#         language: python
+#         image: ghcr.io/example-org/widgets-importer
+#         singleton: true          # it holds its run state in memory
+#         memory: 512Mi
+#         metrics: {port: 8080}    # a worker is scraped through a metrics-only Service
+#         env:
+#           PGHOST:     {secret: widgets-db-app, key: host}
+#           PGPASSWORD: {secret: widgets-db-app, key: password}
+
+# The agent plane (the AGENT-PLANE.md record, v2: a removed record, see docs/README.md in
+# orbit-core, "Retired design records"; the plane itself is V2, docs/V1.md §9). An agent is a catalog entry
+# — there is no CRD layer and no external control plane — and scripts/catalog-sync.py
+# renders it into ordinary Kubernetes workloads on the published runtime image:
+#
+#   agents: -> clusters/apps/orbit-agents-prod.yaml   (Deployment + Service per agent,
+#                                                      one namespace for the whole plane)
+#
+# One namespace, deliberately, and its NetworkPolicy is NARROWER than a tenant's: it
+# admits only its own pods (whatever wakes an agent — the D.3 intake — is a neighbour),
+# not traefik/monitoring/cnpg. That is because an agent pod holds the org's
+# subscription token: the broad tenant admit list would let a Grafana editor reach the
+# agent through the datasource proxy. Nothing here is exposed publicly — no hostname, no
+# Ingress. Egress stays open to the internet (the model call needs it).
+#
+# Two credentials, both POINTERS. Neither value is ever written in this file:
+#   * CLAUDE_CODE_OAUTH_TOKEN — the org's `claude setup-token`, one sops-sealed key for the
+#     whole plane, mounted as the Secret `orbit-claude-code`. Subscription only; an API
+#     key is refused by the runtime itself.
+#   * AGENT_<NAME>_TOKEN — the bearer every caller of that agent must present. One
+#     sops-sealed key per agent; the runtime answers 503 to every POST without it.
+# The generator REFUSES any non-agent project that names either key. Add both to the
+# sops-sealed Secret (prod) BEFORE declaring an agent: no Secret is produced for a key
+# that does not exist, and the pod then sits in CreateContainerConfigError.
+#
+# agents:
+#   - name: hello-orbit          # DNS label, <= 22 chars; the workload, Service and
+#                                # OTel service.name all derive from it
+#     prompt: |                  # the system prompt; required, <= 8192 chars
+#       You are an Orbit platform agent. Answer briefly and factually.
+#     model: claude-sonnet-4-6   # default (settled); haiku for sweeps, opus for hard work
+#     mode: deployment           # deployment (a warm Deployment + Service) or cronjob
+#                                # (a CronJob on `schedule:`, no Deployment and no
+#                                # Service — so its dispatch is `job`). A cronjob
+#                                # agent also takes concurrencyPolicy (Forbid),
+#                                # startingDeadlineSeconds and the history limits;
+#                                # a schedule on a deployment agent is REFUSED
+#                                # rather than silently ignored.
+#     skills: [orbit-observe]    # directories under .claude/skills, mounted read-only
+#     class: background          # interactive | batch | background  (default background)
+#     memory: 64Mi               # the RESERVATION: what this pod holds when idle
+#     memoryLimit: 512Mi         # optional burst ceiling. An agent pod spawns the
+#                                # `claude` CLI per task, so idle and peak are
+#                                # genuinely different numbers; omit it and the
+#                                # limit equals the request, as everywhere else
+#     maxTurns: 12               # brakes: a run that cannot end is an unbounded budget
+#     timeoutSeconds: 300
+#     maxConcurrency: 2
+#     enabled: true
+#     # The runtime image is one instance-level pin (agentRuntime in instance/config.yaml)
+#     # for the WHOLE plane — there is no per-agent image, on purpose: it would let a
+#     # catalog entry choose the registry the mounted token is sent to.
+#
+# Triggers (Phase D.3). What WAKES an agent. Declaring any `triggers:` renders the intake
+# event router into this same plane — a Deployment, a Service, the compiled routing
+# ConfigMap, three sops-sealed source credentials, and (only if something
+# dispatches as a Job) a Role granting create+get on batch/jobs in this namespace and
+# nothing else. No triggers anywhere, no router: the plane pays nothing for it.
+#
+# `cron` is not in this list because it already exists: mode: cronjob + schedule IS the
+# cron trigger. `metric` and `logs` DO render (corrected 2026-09-07 — they were refused
+# when this comment was written): each renders the RULE as well as the route, so the
+# route is never in front of something that can never fire. A `metric` trigger renders a
+# PrometheusRule in the plane's namespace plus an `alert` route matching the alertname it
+# generates; a `logs` trigger renders a Loki rule ConfigMap (labelled `loki_rule`, in the
+# loki namespace) plus the same kind of route, and is GATED on `lokiRuler: wired` in
+# instance/config.yaml because a stock ruler loads neither the rule nor an
+# alertmanager_url. Both take: name, expr (PromQL / LogQL), for, severity, summary.
+#
+# The task text the agent receives is shaped by the router from a fixed set of fields and
+# is bounded; the event payload chooses nothing else about the run.
+#
+# agents:
+#   - name: triage
+#     prompt: |
+#       You triage Orbit alerts. Investigate and report; change nothing.
+#     dispatch: service          # service (call the warm Deployment) | job (one-shot Job).
+#                                # Defaults to service for a deployment agent and job for a
+#                                # cronjob agent, which renders no Service to call.
+#     triggers:
+#       - type: alert            # an Alertmanager notification, matched on labels.
+#         match:                 # ALL pairs must match; values are exact strings — quote
+#           alertname: OrbitSiteDown   # REQUIRED: a match with no alertname would also
+#                                # catch the plane's own generated alerts, and the shipped
+#           severity: critical   # Alertmanager route (OrbitAgent* only) could not deliver
+#           status: firing       # it. `status` matches firing/resolved.
+#                                # NOTE: a custom alertname needs its own Alertmanager
+#                                # route to the orbit-intake receiver — see AGENT-PLANE.md.
+#       - type: github           # a GitHub webhook, HMAC-verified before it is parsed.
+#         repo: acme/widgets     # owner/name, exact
+#         events: [pull_request] # explicit; there is deliberately no wildcard
+#                                # GATED on `intakeIngress: wired` in instance/config.yaml:
+#                                # the generator renders the route, never the public door.
+#       - type: a2a              # an operator or another agent POSTing /a2a/triage

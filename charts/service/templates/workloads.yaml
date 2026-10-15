@@ -1,0 +1,246 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.project }}
+  labels:
+    app.kubernetes.io/instance: {{ .Values.project }}
+# No workload here talks to the Kubernetes API, so nothing needs a mounted token —
+# and a token that is never used is only ever a credential to steal.
+automountServiceAccountToken: false
+{{- range $c := .Values.components }}
+{{- $ctx := dict "root" $ "comp" $c }}
+{{- $kind := $c.kind | default "web" }}
+{{- /* Untagged: no tag yet and none pinned in `image:`. Until the first ship writes a tag
+     the image would render as :latest, which an Orbit registry never carries: every pod
+     sat in ImagePullBackOff, and a CronJob's first run hung there for good and — under
+     concurrencyPolicy Forbid — blocked every run after it (docs/V1.md §8, checkers-lab).
+     So nothing runs until the first ship: a Deployment renders zero replicas and a
+     CronJob renders suspended. The ship's tag lifts both, with no catalog edit. */}}
+{{- $base := last (splitList "/" ($c.image | default "")) }}
+{{- $untagged := and (not $c.tag) (not (contains "@" ($c.image | default ""))) (not (contains ":" $base)) }}
+---
+{{- if eq $kind "cron" }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "service.name" $ctx }}
+  labels: {{- include "service.labels" $ctx | nindent 4 }}
+spec:
+  schedule: {{ required (printf "component %s is kind: cron and needs a schedule" $c.name) $c.schedule | quote }}
+  {{- if $untagged }}
+  suspend: true
+  {{- end }}
+  timeZone: {{ $c.timeZone | default "Asia/Jerusalem" | quote }}
+  {{- /* Cron controls are overridable, defaulting to the values these were hardcoded to
+       before Phase D.3 — so a cron component that sets none renders byte-identically.
+       The integer fields use hasKey rather than sprig default, because default treats 0
+       as empty and would silently rewrite a deliberate backoffLimit 0 (no retries) or
+       failedJobsHistoryLimit 0 (keep none) to the default. The agent plane always passes
+       these explicitly (scripts/catalog-sync.py). Each comment here ends plain, never
+       right-trimmed: a right-trim eats the newline before the next key and glues two YAML
+       lines into one — the exact break this file warns about. */}}
+  concurrencyPolicy: {{ $c.concurrencyPolicy | default "Forbid" }}
+  startingDeadlineSeconds: {{ if hasKey $c "startingDeadlineSeconds" }}{{ $c.startingDeadlineSeconds }}{{ else }}300{{ end }}
+  successfulJobsHistoryLimit: {{ if hasKey $c "successfulJobsHistoryLimit" }}{{ $c.successfulJobsHistoryLimit }}{{ else }}3{{ end }}
+  failedJobsHistoryLimit: {{ if hasKey $c "failedJobsHistoryLimit" }}{{ $c.failedJobsHistoryLimit }}{{ else }}3{{ end }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ if hasKey $c "backoffLimit" }}{{ $c.backoffLimit }}{{ else }}2{{ end }}
+      {{- /* A finished run's Job is deleted after 20 minutes. Kept for good (the history
+           limits above keep the last three failed), one failed run fired KubeJobFailed until
+           three later runs had failed too: a run cut by a node reboot rang for hours while
+           every run after it succeeded (docs/V1.md §8, S16). A cron that keeps failing
+           keeps a failed Job in sight; its lines are in the logs either way. */}}
+      ttlSecondsAfterFinished: {{ if hasKey $c "ttlSecondsAfterFinished" }}{{ $c.ttlSecondsAfterFinished }}{{ else }}1200{{ end }}
+      {{- /* The Job-level wall-clock backstop. Absent by default (unbounded, as before);
+           the agent plane derives it from the agent's task timeout. */}}
+      {{- with $c.activeDeadlineSeconds }}
+      activeDeadlineSeconds: {{ . }}
+      {{- end }}
+      template:
+        metadata:
+          labels: {{- include "service.labels" $ctx | nindent 12 }}
+            {{- /* A component that declares `egress:` carries this label so the
+                 namespace's open egress grant (which selects on its absence) stops
+                 selecting it. On the pod template only, never the selector: selector
+                 labels are immutable, so a selector label would need the workload
+                 deleted and recreated to adopt egress. */}}
+            {{- if $c.egress }}
+            orbit.local/egress: {{ $.Values.egressLabelValue | default "declared" }}
+            {{- end }}
+          {{- with $c.language }}
+          annotations:
+            instrumentation.opentelemetry.io/inject-{{ . }}: "true"
+          {{- end }}
+        spec:
+          {{- /* Defaults to OnFailure (a batch job's pod retries in place); the agent
+               plane sets Never, so a failed scheduled run is a fresh Job attempt bounded
+               by backoffLimit rather than a hot-loop that re-runs a partial task. */}}
+          restartPolicy: {{ $c.restartPolicy | default "OnFailure" }}
+          {{- include "service.podSpec" $ctx | nindent 10 }}
+{{- else }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "service.name" $ctx }}
+  labels: {{- include "service.labels" $ctx | nindent 4 }}
+spec:
+  replicas: {{ if $untagged }}0{{ else if $c.singleton }}1{{ else }}{{ $c.replicas | default 1 }}{{ end }}
+  selector:
+    matchLabels: {{- include "service.selectorLabels" $ctx | nindent 6 }}
+  strategy:
+    {{- if $c.singleton }}
+    # Recreate, not RollingUpdate: a singleton must never have two pods alive at once.
+    # The shape this exists for: an alert listener that holds an in-memory dataset and
+    # writes to a shared feed — two of it would double-publish every alert. A few seconds
+    # of downtime per deploy is the right trade.
+    type: Recreate
+    {{- else }}
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+    {{- end }}
+  template:
+    metadata:
+      # Full labels on the pod, not just the selector subset: env and class need to be
+      # queryable in Prometheus, and the selector itself is immutable so it cannot grow.
+      labels: {{- include "service.labels" $ctx | nindent 8 }}
+        {{- /* A component that declares `egress:` carries this label so the
+             namespace's open egress grant (which selects on its absence) stops
+             selecting it. On the pod template only, never the selector. */}}
+        {{- if $c.egress }}
+        orbit.local/egress: {{ $.Values.egressLabelValue | default "declared" }}
+        {{- end }}
+      {{- if or $c.language $c.configChecksum }}
+      annotations:
+        {{- with $c.language }}
+        # The catalog's `language:` is what turns on SDK injection: the OTel Operator's
+        # webhook sees this annotation at admission and adds the language runtime's SDK
+        # to the pod. Connected traces are a catalog fact, not an app change.
+        instrumentation.opentelemetry.io/inject-{{ . }}: "true"
+        {{- end }}
+        {{- with $c.configChecksum }}
+        # A content hash of the ConfigMap this component MOUNTS, stamped on the POD
+        # TEMPLATE so a change to that content is a change to the Deployment — which is
+        # what makes Argo roll the pod. A process that parses its mounted config ONCE at
+        # startup (the agent plane's intake router does exactly this) otherwise keeps
+        # serving the old copy forever: the ConfigMap updates, the pod does not restart,
+        # and the only symptom is the router answering 404 for a route the repo says
+        # exists. Deliberately NOT a timestamp — the value is a hash of the rendered
+        # content, so re-rendering an unchanged catalog is byte-identical and `make check`
+        # stays clean. Only long-lived pods need it: a CronJob's pod is created fresh for
+        # every run and always reads the current ConfigMap, so `kind: cron` gets none.
+        checksum/config: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+    spec:
+      {{- include "service.podSpec" $ctx | nindent 6 }}
+{{- end }}
+
+{{- if and $c.metrics $c.metrics.port (eq $kind "cron") }}
+{{- fail (printf "component %s is kind: cron and declares metrics: a CronJob's pod exists for seconds, so a ServiceMonitor over it scrapes nothing and reports no error. Record the outcome in a table a scraped service re-exports instead." $c.name) }}
+{{- end }}
+
+{{- if and (eq $kind "web") $c.port $c.metrics $c.metrics.port (eq (int $c.metrics.port) 80) (ne (int $c.port) 80) }}
+{{- fail (printf "component %s is kind: web on port %v and puts metrics on 80, which is the number the http port already publishes — a Service may not declare one number twice, so this renders a manifest the API server refuses and Argo stalls on. Serve metrics on the app's own port (metrics: {port: %v}) or on a port of its own." $c.name $c.port $c.port) }}
+{{- end }}
+
+{{- if or (and (eq $kind "web") $c.port) (and $c.metrics $c.metrics.port (ne $kind "cron")) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "service.name" $ctx }}
+  labels: {{- include "service.labels" $ctx | nindent 4 }}
+spec:
+  selector: {{- include "service.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    {{- if and (eq $kind "web") $c.port }}
+    - name: http
+      port: 80
+      targetPort: {{ $c.port }}
+    {{- /* The SAME number the container listens on, published a second time. Port 80
+         above stays the address a caller SHOULD use — it is the only one the Ingress and
+         every in-tree URL name — and this one exists because of what happens when a
+         caller uses the other number instead. kube-proxy installs DNAT for DECLARED
+         service ports only: a SYN to a ClusterIP on an undeclared port matches no
+         KUBE-SERVICES rule, and 10.43.0.0/16 has no route and no host, so the packet is
+         blackholed and TCP retransmits until the caller's own timeout. Reproduced
+         2026-08-31 from a pod in the agent plane: ClusterIP:8080 timed out at 8002 ms
+         while podIP:8080 and ClusterIP:80 both returned 200 — an asymmetry that reads
+         exactly like a NetworkPolicy bug and is not one (a denial on this cluster fails
+         in 0 ms). An in-cluster client that learns the port from the pod spec, or from a
+         successful pod-IP probe, reaches for that number; declaring it makes the
+         wrong-but-obvious address work instead of hang. Skipped when the container
+         already listens on 80 — a Service may not declare one number twice — and it can
+         never collide with the `metrics` port below, which renders only when its number
+         differs from this one. Ends plain, never right-trimmed — see the CronJob block. */}}
+    {{- if ne (int $c.port) 80 }}
+    # The container's own port, published so an in-cluster caller that dials it reaches
+    # the pods instead of a blackholed address. Prefer port 80 above.
+    - name: http-direct
+      port: {{ $c.port }}
+      targetPort: {{ $c.port }}
+    {{- end }}
+    {{- end }}
+    {{- if and (ne $kind "web") $c.port $c.metrics $c.metrics.port (eq (int $c.metrics.port) (int $c.port)) }}
+    # A non-web component serving health and metrics on one port: the ServiceMonitor
+    # names `http`, so the Service must publish it, or the endpoint list is empty and the
+    # scrape silently never happens.
+    - name: http
+      port: {{ $c.port }}
+      targetPort: {{ $c.port }}
+    {{- end }}
+    {{- if and $c.metrics $c.metrics.port (ne (int $c.metrics.port) (int ($c.port | default 0))) }}
+    # A worker has no http port and still needs a Service: a ServiceMonitor selects
+    # Endpoints, not pods, so a metrics port with no Service behind it renders green,
+    # scrapes nothing, and the alert built on it can never fire. A singleton listener is
+    # exactly that shape — the only thing it serves is its own liveness.
+    - name: metrics
+      port: {{ $c.metrics.port }}
+      targetPort: {{ $c.metrics.port }}
+    {{- end }}
+{{- end }}
+
+{{- if and $c.metrics $c.metrics.port }}
+---
+# Scraping is opt-in per component. Services with no metrics endpoint are covered by
+# blackbox probes instead — asserting probe_success rather than a fictional `up` series.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "service.name" $ctx }}
+  labels: {{- include "service.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {{- include "service.selectorLabels" $ctx | nindent 6 }}
+  endpoints:
+    - port: {{ if eq (int $c.metrics.port) (int ($c.port | default 0)) }}http{{ else }}metrics{{ end }}
+      path: {{ $c.metrics.path | default "/metrics" | quote }}
+      interval: 30s
+      # The catalog's own names on every series (docs/V1.md §6.1), from the labels this
+      # chart stamps on the pod: one value per target, so cardinality does not grow.
+      relabelings:
+        - {sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_instance], targetLabel: project}
+        - {sourceLabels: [__meta_kubernetes_pod_label_orbit_local_env], targetLabel: env}
+        - {sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_name], targetLabel: component}
+  {{- /* A label explosion stops at the door: a target returning more samples than this is
+       not scraped (OrbitScrapeSampleLimitHit pages) instead of growing Prometheus until it
+       is OOM-killed. A tenant api exposes ~700 today (docs/V1.md §6.6). */}}
+  sampleLimit: 5000
+{{- end }}
+
+{{- with $c.persistence }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "service.name" $ctx }}
+  labels: {{- include "service.labels" $ctx | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ $.Values.storageClassName }}
+  resources:
+    requests:
+      storage: {{ .size }}
+{{- end }}
+{{- end }}

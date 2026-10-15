@@ -1,0 +1,86 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# Lock Tempo's ingress (audit 2026-08-28 LOW/MED). The tempo namespace carried no
+# NetworkPolicy, so from any pod in the cluster Tempo's :3200 answered the full query API —
+# /api/search, /api/traces/{id}, /api/v2/search/tags — with auth_enabled off. A trace is not
+# a neutral artifact: it carries the URL path, the HTTP method, the status and the service
+# graph of every request through Traefik and every SDK-injected pod (every
+# tenant's prod namespace). A compromised public pod could read the shape of production traffic it was
+# never party to, and enumerate the internal service topology from the outside of it.
+#
+# Selects the tempo pod and switches it to default-deny ingress. The rules split the two
+# halves of Tempo's surface, which is the whole point of this policy:
+#
+#   :3200 is the READ path (query API + /metrics) and has exactly TWO callers, both in
+#   monitoring — Grafana's Tempo datasource (kube-prometheus-stack.yaml, url
+#   http://tempo.tempo.svc:3200) and Prometheus's scrape of the tempo-prom-metrics port.
+#   Nothing else in the cluster has any business reading traces.
+#
+#   :4317/:4318 are the WRITE path (OTLP ingest) and have many writers, only some of which
+#   are knowable here: Traefik's root span (traefik.yaml), and the OTEL SDKs the operator
+#   injects into every app namespace via the per-namespace Instrumentation CRs — which are
+#   GENERATED from the catalog, so the set grows whenever a project is onboarded.
+#   Enumerating them would guarantee drift and a silently broken trace pipeline on the next
+#   onboarding, so ingest is admitted from all namespaces by design. The residual risk is
+#   span FORGERY (a hostile pod writing fake traces), which is real but strictly less than
+#   the read the audit flagged — and the accepted price of an open OTLP door.
+#
+# Alloy is deliberately absent: it is logs-only (loki.write, no OTLP exporter)
+# and pushes no traces, so it needs no rule.
+#
+# KNOWN EDGE — hostNetwork: `namespaceSelector: {}` matches pods by their pod IP, so a
+# hostNetwork pod, whose traffic is sourced from the NODE IP, does NOT match it and would be
+# dropped on the OTLP ports. No hostNetwork pod writes traces today, so nothing is
+# affected right now. If a node-level trace producer is ever added
+# (a hostNetwork collector), it will fail SILENTLY — spans simply stop arriving, with no error
+# on either side. The fix at that point is an explicit ipBlock for the node CIDR on
+# :4317/:4318, not widening the read path.
+#
+# Ingress-only: Tempo's egress — the S3 bucket and the metrics-generator's remote_write to
+# Prometheus :9090 — is untouched. Kubelet health probes come from the node and are not
+# policed by this CNI (proven by the app namespaces' default-deny, which runs healthy with
+# probes). One side effect is intentional: the chart's legacy receivers that the Service
+# still publishes but nothing here dials — Jaeger thrift (6831/6832/14268/14250), Zipkin
+# (9411), OpenCensus (55678) and the legacy OTLP ports (55680/55681) — are now closed to
+# the cluster, which removes an unused ingest surface rather than adding a restriction.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tempo-ingress
+  namespace: tempo
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: tempo
+  policyTypes: [Ingress]
+  ingress:
+    # READ (:3200): Grafana's Tempo datasource queries here and Prometheus scrapes /metrics
+    # here — both live in monitoring, and they are the only legitimate readers.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - {protocol: TCP, port: 3200}
+    # orbitd reads Tempo on :3200.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: orbit
+      ports:
+        - {protocol: TCP, port: 3200}
+    # WRITE (OTLP :4317 gRPC / :4318 HTTP): Traefik and every injected SDK. Admitted from
+    # all namespaces because the writer set is generated per project — see the header. This
+    # still narrows the door: only in-cluster pods match a namespaceSelector.
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - {protocol: TCP, port: 4317}
+        - {protocol: TCP, port: 4318}
+    # Same-namespace: the single binary dials itself through the Service (distributor ->
+    # ingester -> querier are one process, but the internal gRPC ring still connects); a
+    # present policy would otherwise deny those self-directed connections.
+    - from:
+        - podSelector: {}

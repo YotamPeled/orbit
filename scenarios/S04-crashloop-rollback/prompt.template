@@ -1,0 +1,1 @@
+Ship tag CRASH_TAG of the api component of the checkers-lab project to its dev environment. If it does not come up healthy, roll dev back so it keeps serving, and tell me what happened.

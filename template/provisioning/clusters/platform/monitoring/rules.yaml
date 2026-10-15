@@ -1,0 +1,489 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# Orbit's own alert rules.
+#
+# Only what the stack's 120 default rules do NOT already cover. Pod crash-looping, node
+# memory and disk pressure, failed Jobs, a node going NotReady and a scrape target
+# disappearing all ship with kube-prometheus-stack and are already firing-capable; adding
+# our own versions would page twice for one event and, worse, would make the pair drift.
+#
+# What is left is everything the cluster cannot see about itself: whether the public URL
+# actually answers, whether the certificate in front of it is about to expire, whether the
+# leaderboard's database is reachable, and whether anything has been backed up lately.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: orbit
+  namespace: monitoring
+spec:
+  groups:
+    - name: orbit.node
+      rules:
+        # Phase B.0: the node's disk is where images, local-path PVCs and (until the
+        # bucket lands) all log data live. Nothing else here watches it, and a full
+        # disk takes down everything at once — containerd evictions first, then etcd.
+        # Warning leaves days of runway at normal growth; critical means act today.
+        - alert: NodeDiskLow
+          expr: (node_filesystem_avail_bytes{mountpoint="/",fstype!="tmpfs"} / node_filesystem_size_bytes{mountpoint="/",fstype!="tmpfs"}) < 0.30
+          for: 30m
+          labels: {severity: warning}
+          annotations:
+            summary: "Node root filesystem below 30% free"
+            description: >-
+              {{ $labels.instance }} has {{ $value | humanizePercentage }} of its root
+              filesystem free. Images, local-path volumes and container logs all live
+              here; find what grew before it decides for you.
+        - alert: NodeDiskCritical
+          expr: (node_filesystem_avail_bytes{mountpoint="/",fstype!="tmpfs"} / node_filesystem_size_bytes{mountpoint="/",fstype!="tmpfs"}) < 0.15
+          for: 10m
+          labels: {severity: critical}
+          annotations:
+            summary: "Node root filesystem below 15% free"
+            description: >-
+              {{ $labels.instance }} is close to full. Kubelet eviction and image GC
+              thresholds are near; production pods will be evicted if this continues.
+
+    - name: orbit.workloads
+      rules:
+        # Nothing fires when a platform component OOMKills and restarts cleanly. The
+        # stack's own KubePodCrashLooping needs waiting_reason="CrashLoopBackOff"
+        # sustained 15m — structurally unreachable for a container that OOMKills and comes
+        # straight back Ready, which is exactly the shape that bites a single-node box.
+        #
+        # NOT keyed on kube_pod_container_status_last_terminated_reason="OOMKilled": a k3s
+        # kubelet reports an OOMKill as reason="Error" with exitCode 137 and
+        # container_oom_events_total stays 0, so a reason="OOMKilled" match is permanently
+        # DORMANT. The exit CODE is the usable OOM signature —
+        # kube_pod_container_status_last_terminated_exitcode carries 137 as its value.
+        #
+        # The first cut of this was increase(...[1h]) > 0, which fired on ANY single
+        # in-place restart and held for a full hour, so one benign restart pinned the pager
+        # after every deploy. Reshaped to fire only on what is actionable, in two ORed
+        # branches:
+        #   (A) crash-loop by count: >2 restarts in 15m. A rolling deploy makes a NEW pod
+        #       (restart count 0) and an intentional restart is a single graceful SIGTERM,
+        #       so neither reaches 3 in-place restarts in 15m — but a real crash-loop blows
+        #       straight past it.
+        #   (B) OOM caught in the act: a container that restarted in-place in the last 15m
+        #       AND whose last termination was exit 137. This catches the SINGLE silent
+        #       OOMKill branch A alone would miss, and never fires on an intentional
+        #       restart — those exit 0 or 143, never 137.
+        # Both branches use a 15m window, so the condition ages out ~15m after the event
+        # instead of staying red for an hour on a benign blip.
+        #
+        # Scoped to the platform and production namespaces: a fast restart in a prod tenant
+        # is as silent as one in monitoring.
+        - alert: PlatformContainerRestarted
+          expr: >-
+            (
+              increase(kube_pod_container_status_restarts_total{namespace=~"monitoring|loki|tempo|alloy|argocd|.*-prod"}[15m]) > 2
+            )
+            or
+            (
+              (increase(kube_pod_container_status_restarts_total{namespace=~"monitoring|loki|tempo|alloy|argocd|.*-prod"}[15m]) > 0)
+              and on(namespace, pod, container)
+              (kube_pod_container_status_last_terminated_exitcode == 137)
+            )
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: container {{ $labels.container }} is restarting (crash-loop or OOM)"
+            description: >-
+              A container that was already running has either restarted more than twice in
+              15 minutes (a crash-loop) or restarted with its last termination at exit 137
+              — an OOMKill this kubelet labels reason=Error, so the pager cannot name it,
+              but the exit code can. It may be back Ready now, which is why nothing else
+              noticed. Check the pod's lastState.terminated and its memory ceiling.
+
+        # A tenant workload that sits at its memory limit and is NOT killed (docs/V1.md
+        # M4b): no out-of-memory kill, no restart, so neither branch of the rule above
+        # can see it, and it has no room for its next allocation.
+        #
+        # What this rule does NOT see, said here because it was first written as if it
+        # did: a runtime that caps its own heap BELOW the container limit. On 2026-10-06
+        # a .NET service answered 500 for hours inside its 256Mi, and measured on
+        # 2026-10-08 it was throwing OutOfMemoryException with the container at 56% of
+        # its limit (.NET caps the heap at 75% of the limit and counts what it has
+        # committed, not what is resident; a JVM's default cap is 25%). No threshold on
+        # the container's memory tells that from a healthy service. It shows as failed
+        # requests: OrbitIngress5xxRateHigh fired for that service within ten minutes.
+        #
+        # Working set over the container's own limit, above 0.9 for 15 minutes: a
+        # spike of a few minutes is a request being served, a quarter of an hour is
+        # where the workload lives. A container with no memory limit has no
+        # kube_pod_container_resource_limits series, so the division drops it. The
+        # max by on both sides is load-bearing: cAdvisor keeps a series per container
+        # instance, and a pod that restarted would give the division two matches.
+        #
+        # Tenant namespaces only, by the same kube_namespace_labels join the platform
+        # memory budget uses to EXCLUDE them: the platform has that budget, and its
+        # stores hold page cache at their limits by design. The join is also where
+        # the project and env labels come from (kube-state-metrics exports both
+        # namespace labels: metricLabelsAllowlist on the chart); component is the
+        # container's name, which the service chart sets to the catalog component.
+        - alert: OrbitWorkloadMemoryAtLimit
+          expr: >-
+            label_replace(
+              (
+                max by (namespace, pod, container) (container_memory_working_set_bytes{container!="",container!="POD"})
+                / on (namespace, pod, container)
+                max by (namespace, pod, container) (kube_pod_container_resource_limits{resource="memory"})
+                > 0.9
+              )
+              * on (namespace) group_left (project, env)
+              max by (namespace, project, env) (
+                label_replace(
+                  label_replace(kube_namespace_labels{label_orbit_local_project!=""},
+                    "project", "$1", "label_orbit_local_project", "(.+)"),
+                  "env", "$1", "label_orbit_local_env", "(.+)")
+              ),
+              "component", "$1", "container", "(.+)")
+          for: 15m
+          labels: {severity: warning}
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: {{ $labels.component }} is at its memory limit"
+            description: >-
+              {{ $labels.component }} in {{ $labels.namespace }} has used more than 90% of
+              its memory limit for 15 minutes ({{ $value | humanizePercentage }} now) and
+              has not been killed. It has no room left: its next allocation fails or gets
+              it killed. Look at its error rate, then ask orbit_size_recommend for this
+              project and environment.
+
+    # orbit:feature uptime
+    - name: orbit.public-surfaces
+      rules:
+        - alert: OrbitSiteDown
+          # probe_success is produced by the blackbox exporter walking the real path.
+          # `up` for the same service stays 1 through an expired certificate, a lost
+          # Traefik router and a DNS change — this does not.
+          expr: probe_success == 0
+          for: 3m
+          labels: {severity: critical}
+          annotations:
+            summary: "{{ $labels.instance }} is not answering"
+            description: >-
+              The public URL has failed its check for three minutes. This is measured from
+              outside the cluster, so the cause may be DNS, the certificate, Traefik or the
+              pod itself — the dashboards for that service say which.
+
+        - alert: OrbitCertificateExpiringSoon
+          # cert-manager renews at 30 days. Firing at 14 means renewal has already had two
+          # weeks to succeed and has not, which is a real failure rather than a countdown.
+          expr: probe_ssl_earliest_cert_expiry - time() < 14 * 24 * 3600
+          for: 1h
+          labels: {severity: warning}
+          annotations:
+            summary: "TLS certificate for {{ $labels.instance }} expires in under 14 days"
+            description: >-
+              cert-manager renews at 30 days remaining, so reaching 14 means renewal has
+              been failing for a fortnight. Check the Certificate and Order objects in the
+              traefik namespace.
+    # orbit:end uptime
+
+    # orbit:feature databases
+    - name: orbit.backups
+      # The pg_dump staleness alerts that used to live here left with the dump path itself
+      # (core v0.4.0 — the bucket chain replaced it, restore-proven by the PITR drill), so
+      # a `*-db-backup` CronJob no longer exists for them to key on. Base-backup STALENESS
+      # has no honest metric yet: the barman plugin does not populate
+      # cluster.status.lastSuccessfulBackup, so cnpg_collector_last_available_backup_
+      # timestamp reads 0 and an alert on it would page forever. Until the plugin fills it
+      # (or kube-state-metrics learns Backup CRs), staleness is stage3's daily check; the
+      # WAL alerts below are the pager — a stale base only lengthens replay, and retention
+      # never deletes the last base backup.
+      rules:
+        # orbit:feature backups
+        - alert: OrbitWALArchiveStalled
+          # A dead archiver is not just lost backups: Postgres retains every un-archived
+          # WAL segment on the data volume until it fills and the live database stops.
+          # The signal is the .ready BACKLOG, not archival age: archive_timeout forces a
+          # switch only when new WAL exists, so an idle database goes quiet for hours
+          # and an age-keyed alert pages every quiet night (observed 2026-08-27). The
+          # metric exists only on clusters whose chart enabled the PodMonitor, which
+          # happens exactly when archiving does — so dev databases cannot false-fire.
+          expr: |
+            cnpg_collector_pg_wal_archive_status{value="ready"} > 2
+          for: 15m
+          labels: {severity: critical}
+          annotations:
+            summary: "{{ $labels.namespace }}: WAL segments are piling up un-archived"
+            description: >-
+              WAL archiving to object storage has stalled. Un-archived segments are
+              accumulating on the data volume; when it fills, Postgres stops accepting
+              writes. Check the orbit-s3 credential and the bucket, then the cluster's
+              ContinuousArchiving condition.
+
+        - alert: OrbitWALArchiveFailing
+          # The staleness rule cannot see a cluster whose archiver fails fast and often
+          # while an occasional segment still lands; failure count catches that shape.
+          expr: |
+            increase(cnpg_pg_stat_archiver_failed_count[30m]) > 0
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "{{ $labels.namespace }}: WAL archive commands are failing"
+            description: >-
+              barman-cloud-wal-archive is returning errors. Archiving may still limp
+              along, but every failure is retried WAL held on local disk.
+        # orbit:end backups
+        # A tenant database that is not serving (docs/V1.md §6.3, "DB down"). CNPG's
+        # exporter runs in the instance pod; cnpg_collector_up 0 means the pod is up
+        # and the database is not. It is not enough on its own: with Postgres stopped
+        # by the instance manager (fenced, measured 2026-10-05) the collector kept
+        # reporting 1 while the postgres container was not ready. So either signal,
+        # the second kept to database pods by the `and on` (only CNPG instance pods
+        # carry cnpg_collector_up, whose labels name the cluster).
+        - alert: OrbitDatabaseDown
+          expr: >-
+            (cnpg_collector_up == 0)
+            or
+            (cnpg_collector_up and on (namespace, pod)
+              (kube_pod_container_status_ready{container="postgres"} == 0))
+          for: 5m
+          labels: {severity: critical}
+          annotations:
+            summary: "{{ $labels.namespace }}: database {{ $labels.cluster }} is not answering"
+            description: >-
+              Postgres in {{ $labels.pod }} is not serving (CloudNativePG's exporter
+              cannot reach it, or its container is not ready). The application's reads
+              and writes are failing; check the cluster's status (fenced? hibernated?),
+              the instance pod's logs and its volume.
+
+    # orbit:end databases
+    - name: orbit.capacity
+      rules:
+        # The chart's KubeCPUQuotaOvercommit / KubeMemoryQuotaOvercommit are
+        # deliberately disabled: quotas here are generous runaway backstops, not
+        # capacity reservations, so the sum of quotas crosses their lines on a
+        # healthy box. But disabling them removed the only watcher on whether the
+        # next pod still FITS. This is that watcher, measured the other way: the
+        # sum of what is actually requested on each node against what the node
+        # offers. Requests are the scheduler's currency — usage can burst, but a
+        # node whose requests exceed allocatable cannot place anything new, and
+        # on one node that means nothing new runs anywhere.
+        #
+        # Built on the stock cluster:namespace:pod_{memory,cpu}:active:
+        # kube_pod_container_resource_requests recording rules, which carry the
+        # node label and already exclude finished pods; the raw
+        # kube_pod_container_resource_requests underneath still counts
+        # Succeeded/Failed pods whose objects linger, and those request nothing
+        # the scheduler must honour. Memory and cpu are separate branches because
+        # a node runs out of one of them, never of "resources" in general.
+        # 0.9 leaves a tenth of the node for the kubelet, the log collectors and
+        # the next deploy's surge; `for` 15m because a rolling deploy briefly
+        # double-books requests and that is normal, not a page.
+        - alert: OrbitNodeReservationHigh
+          expr: >-
+            (
+              sum by (node) (cluster:namespace:pod_memory:active:kube_pod_container_resource_requests)
+              / sum by (node) (kube_node_status_allocatable{resource="memory"})
+              > 0.9
+            )
+            or
+            (
+              sum by (node) (cluster:namespace:pod_cpu:active:kube_pod_container_resource_requests)
+              / sum by (node) (kube_node_status_allocatable{resource="cpu"})
+              > 0.9
+            )
+          for: 15m
+          labels: {severity: warning}
+          annotations:
+            summary: "Node {{ $labels.node }} has over 90% of memory or cpu requested"
+            description: >-
+              The sum of container requests on this node is above 90% of its
+              allocatable memory or cpu. Nothing has failed yet, but the next
+              scale-up or deploy may not schedule. Shed load, grow the node, or
+              lower requests that were set as backstops rather than budgets.
+
+        # Nothing watches the ingress error rate: per-pod restarts fire, the site
+        # being fully down fires, but a service answering one request in twenty
+        # with a 500 sits between the two and pages nobody. The share is per
+        # Traefik service over 5m, and 0.05 is deliberately loose — a backend
+        # that errors occasionally during deploys should not page. The traffic
+        # floor is the load-bearing half: without it, one failed request out of
+        # two on an idle internal service is a 50% error rate and a page for
+        # nothing. Above 0.1 requests/s the ratio means real users are hitting
+        # real errors. `for` 10m so a single bad deploy wave still resolves
+        # itself out of the window before anyone is woken.
+        - alert: OrbitIngress5xxRateHigh
+          expr: >-
+            (
+              sum by (service) (rate(traefik_service_requests_total{code=~"5.."}[5m]))
+              / sum by (service) (rate(traefik_service_requests_total[5m]))
+              > 0.05
+            )
+            and
+            (
+              sum by (service) (rate(traefik_service_requests_total[5m])) > 0.1
+            )
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "Service {{ $labels.service }} is serving over 5% errors"
+            description: >-
+              More than 5% of this Traefik service's responses over the last 5
+              minutes are 5xx, at a traffic level where the ratio is meaningful.
+              The ingress is fine — look at the service behind it: its logs,
+              its readiness, and whatever shipped last.
+
+        # Slow responses at a traffic level where the percentile means something
+        # (docs/V1.md §6.3, "latency"): p95 over one second for ten minutes.
+        - alert: OrbitIngressLatencyHigh
+          expr: >-
+            (
+              histogram_quantile(0.95, sum by (service, le) (rate(traefik_service_request_duration_seconds_bucket[5m])))
+              > 1
+            )
+            and
+            (
+              sum by (service) (rate(traefik_service_request_duration_seconds_count[5m])) > 0.1
+            )
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "Service {{ $labels.service }} answers slowly (p95 over 1s)"
+            description: >-
+              The 95th percentile of this Traefik service's response time has been above
+              one second for ten minutes. Look at the service's traces for the slow span
+              and at whatever shipped last.
+
+        # The platform's own memory against its 2 GiB budget: the sum of every
+        # platform container's RSS, tenants excluded. RSS, not working set: the
+        # working set counts the container's page cache, which the kernel fills
+        # with whatever files were read and drops the moment anything needs the
+        # memory. After a reboot every image layer and Prometheus/Loki/Tempo block
+        # is read back in, the working set of the same platform went from 1.8 to
+        # 2.8 GiB while its RSS FELL from 1.48 to 1.21 GiB, and this alert fired
+        # for memory nobody was holding (docs/V1.md §8, 2026-10-04). Tenant
+        # namespaces carry the orbit.local/project label and are NOT the
+        # platform — a tenant growing into its quota is the quota working, not a
+        # platform overrun, and counting it here would page the platform for a
+        # tenant's success. The exclusion joins kube_namespace_labels, which
+        # exists only because kube-state-metrics is told to export that label
+        # (metricLabelsAllowlist on the chart); without it every namespace
+        # counts and the alert reads high by exactly the tenant footprint.
+        # container!="" drops the per-pod cgroup rollups so each byte is counted
+        # once. 2147483648 is 2 GiB, the budget, not a prediction: firing means
+        # the platform as a whole outgrew the box it was sized for. Judged on the
+        # 15-minute average, held for 20m: RSS breathes with scrapes, compactions and
+        # renders, and a boot replays every WAL at once (measured 2026-10-05: 2.8 GiB
+        # for 2.5 minutes after a reboot, a 15m average of 1.7 GiB at most, so the
+        # bare sum went pending on weather). A breach that holds its average for
+        # ~35 minutes is growth.
+        - alert: OrbitPlatformMemoryOverBudget
+          expr: >-
+            avg_over_time((sum(
+              container_memory_rss{container!=""}
+              unless on (namespace)
+              kube_namespace_labels{label_orbit_local_project!=""}
+            ))[15m:1m]) > 2147483648
+          for: 20m
+          labels: {severity: warning}
+          annotations:
+            summary: "Platform memory is over its 2 GiB budget"
+            description: >-
+              The platform namespaces (tenants excluded) are holding more than
+              2 GiB of resident memory (RSS; file cache is not counted). Find what grew — usually Prometheus
+              retention, Grafana renders, or a sidecar that stopped sharing —
+              before the kubelet starts choosing victims.
+
+    # Watching the watchers (docs/V1.md §6.4): the pipelines that would carry evidence of
+    # every other failure.
+    - name: orbit.observability
+      rules:
+        # orbit:feature logs
+        # Every pod writes to stdout, so a platform with no log lines arriving at all for
+        # fifteen minutes has a broken collector or a broken Loki, not a quiet cluster.
+        - alert: OrbitLogsNotArriving
+          expr: >-
+            (sum(rate(loki_distributor_lines_received_total[10m])) or vector(0)) == 0
+          for: 15m
+          labels: {severity: critical}
+          annotations:
+            summary: "No log lines are reaching Loki"
+            description: >-
+              Loki's distributor has received no lines for fifteen minutes. Alloy, Loki or
+              the path between them is broken, and every log-based check is blind until
+              it is fixed.
+        # The bucket Loki and Tempo keep their data in is refusing them: one alert name,
+        # one rule per store, so each follows its own feature. Loki's S3 client
+        # reports a status per request. A bucket that does
+        # not answer at all leaves Loki's status counter silent (a request that times out
+        # is never counted: measured 2026-10-05 with the bucket's address blocked, every
+        # operation read 0 for minutes, failures included), so the second branch watches
+        # for successful uploads stopping while lines keep arriving; an idle box uploads 7 to
+        # 9 times per 15 minutes, and over three days this branch was true only while the
+        # bucket was blocked on purpose.
+        # ...and, measured 2026-10-08 on a platform built an hour before, in the first 45
+        # minutes of a Loki that has just started: its first chunks are not due yet, so
+        # uploads pause for a quarter of an hour with lines arriving, and the alert fired
+        # at minute 33 and cleared at minute 38 with the bucket answering every request
+        # 200. The second branch therefore waits until Loki has been up 45 minutes. A
+        # Loki whose start time is not reported is not excused (`unless`, not `and`), and
+        # the first branch (a request the bucket refused) has no such wait.
+        - alert: OrbitObjectStoreFailing
+          expr: >-
+            (sum by (job) (rate(loki_s3_request_duration_seconds_count{status_code!~"2.."}[10m])) > 0)
+            or
+            (
+              (sum by (job) (increase(loki_s3_request_duration_seconds_count{operation="S3.PutObject",status_code=~"2.."}[15m])) == 0)
+              and on (job)
+              (sum by (job) (rate(loki_distributor_lines_received_total[5m])) > 0)
+              unless on (job)
+              (max by (job) (time() - process_start_time_seconds{job=~"loki/.*"}) < 2700)
+            )
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "{{ $labels.job }} cannot write to the object store"
+            description: >-
+              Requests to the platform bucket are failing. Logs are held
+              locally until it recovers and are lost if the pod restarts first. Check
+              the orbit-s3 credential, the bucket and the endpoint.
+        # orbit:end logs
+        # orbit:feature traces
+        # Tempo reports the same failure as failed flushes.
+        - alert: OrbitObjectStoreFailing
+          expr: >-
+            sum by (job) (increase(tempo_ingester_failed_flushes_total[15m])) > 0
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "{{ $labels.job }} cannot write to the object store"
+            description: >-
+              Requests to the platform bucket are failing. Traces are held
+              locally until it recovers and are lost if the pod restarts first. Check
+              the orbit-s3 credential, the bucket and the endpoint.
+        # orbit:end traces
+        # orbit:feature logs
+        # A log burst past Loki's ingestion limits is refused, not queued: the lines are
+        # gone. Refusing is the designed valve (docs/V1.md §6.6); refusing SILENTLY is not,
+        # so every discard reason pages.
+        - alert: OrbitLogsDiscarded
+          expr: >-
+            sum by (reason) (increase(loki_discarded_samples_total[10m])) > 0
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "Loki is discarding log lines ({{ $labels.reason }})"
+            description: >-
+              Loki refused log lines in the last ten minutes for {{ $labels.reason }}: a
+              burst past the ingestion rate, too many streams, or lines too old or too
+              long. Those lines are lost; find the noisy pod in Loki's own metrics.
+        # orbit:end logs
+        # A target exposing more samples than its limit (the service chart sets one per
+        # tenant target) is not scraped at all: a label explosion is caught at the door
+        # instead of growing Prometheus until it is OOM-killed.
+        - alert: OrbitScrapeSampleLimitHit
+          expr: >-
+            increase(prometheus_target_scrapes_exceeded_sample_limit_total[10m]) > 0
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "A scrape target exceeds its sample limit (a label explosion)"
+            description: >-
+              At least one target returned more samples than its limit and was not
+              scraped. Its metrics are missing until its cardinality comes down; find it
+              among the targets reporting up == 0.

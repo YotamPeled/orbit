@@ -1,0 +1,63 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# The other half of the intake's public webhook door: without this the Ingress next to it
+# resolves, Traefik picks the right router, and every delivery times out.
+#
+# The agent plane runs default-deny ingress and admits ONLY its own pods
+# (`default-deny-ingress` in clusters/apps/namespaces.yaml, generated: `from: [{podSelector:
+# {}}]`) — narrower than a tenant namespace on purpose, because these pods hold the org's
+# subscription token and every agent's caller bearer. That policy is GENERATED and is
+# inherited by every tenant; it is never edited to make a one-off grant.
+# The grant lives here instead, as a NEW additive policy: NetworkPolicies union, so this
+# adds exactly one source and takes nothing away.
+#
+# NARROWED ON BOTH SIDES, and both narrowings are in ONE from-element:
+#
+#   * TARGET — `app.kubernetes.io/instance: orbit-agents` AND `app.kubernetes.io/name:
+#     intake` selects the intake pods and nothing else in the namespace. It does NOT select
+#     an agent: an agent pod reachable from Traefik would be an unauthenticated agent card
+#     and /.well-known on the internet.
+#   * SOURCE — the `namespaceSelector` and the `podSelector` are keys of the SAME array
+#     element, which is an AND: this admits the Traefik pod in ns traefik. Splitting them
+#     into two array elements would be an OR — "any pod in ns traefik" plus "any pod named
+#     traefik anywhere" — i.e. a whole-namespace grant wearing a pod-narrowing costume.
+#     scripts/verify/stage6.sh parses this file and goes RED on exactly that split, the same
+#     static widen-detector the loki -> Alertmanager:9093 grant carries, because the live
+#     probe for a grant like this is blind to widening (the CNI programs allow-sources on a
+#     sync interval, so an ephemeral probe pod is never in the source set).
+#   * PORT — 8080/TCP only, the intake container port (the Service is 80 -> 8080;
+#     NetworkPolicy matches the container port).
+#
+# BLAST RADIUS, stated rather than waved at. What this admits is Traefik, and what Traefik
+# will send is whatever the Ingress next to it publishes — `/webhook/github` and nothing
+# else. So the reachable surface is one path whose handler reads the raw body, verifies an
+# HMAC-SHA256 signature over those exact bytes BEFORE parsing any JSON, and fails CLOSED
+# with 503 while INTAKE_GITHUB_SECRET is unset. The intake's two unauthenticated routes
+# (GET /healthz, GET /metrics) are NOT published by that Ingress, so this grant does not
+# expose them to the internet — but note honestly that it does open :8080 to the Traefik
+# pod at L3/L4, which is a port, not a path: if the Ingress were ever widened to `/`, this
+# policy would not be the thing that stops it. The path-scoping IS the control; stage6
+# asserts it separately, in git and live.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: orbit-agents-intake-allow-traefik
+  namespace: orbit-agents-prod
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: orbit-agents
+      app.kubernetes.io/name: intake
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - {protocol: TCP, port: 8080}

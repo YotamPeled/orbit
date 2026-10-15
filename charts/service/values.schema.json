@@ -1,0 +1,618 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Orbit service values",
+  "description": "The render gate is the only thing standing between a generated Application and the cluster, and `helm template` validates almost nothing on its own \u2014 a typo'd kind renders a workload with no Service and no error anywhere. This schema is where those mistakes become loud.",
+  "type": "object",
+  "required": [
+    "project",
+    "env",
+    "components"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "project": {
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$"
+    },
+    "env": {
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$"
+    },
+    "hostnames": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$"
+      }
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "image"
+        ],
+        "properties": {
+          "name": {
+            "description": "A DNS label. Unvalidated, this reaches metadata.name unchanged: `../../evil` renders clean and fails only at apply time, and the catalog validates project ids for exactly this while leaving the sibling field open.",
+            "type": "string",
+            "pattern": "^[a-z0-9]([a-z0-9-]{0,20}[a-z0-9])?$"
+          },
+          "kind": {
+            "description": "Enumerated because a typo is otherwise silent: `kind: bogus` renders a Deployment with no Service and no Ingress, and nothing anywhere reports an error.",
+            "enum": [
+              "web",
+              "worker",
+              "cron"
+            ]
+          },
+          "class": {
+            "enum": [
+              "interactive",
+              "batch",
+              "background"
+            ]
+          },
+          "image": {
+            "description": "A bare repository reference with no tag and no digest \u2014 the tag belongs in `tag:`, which is also what CI rewrites. The pattern excludes ':' and '@' deliberately: `image: nginx:1.27` used to render as `nginx:1.27:latest` and a digest ref as `...@sha256:ab:latest`, both of which render green and ImagePullBackOff at runtime. A registry port is unsupported for the same reason; everything here comes from ghcr.io.",
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._/-]{0,255}$"
+          },
+          "tag": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "path": {
+            "description": "No spaces and no '#'. An unquoted `/api #c` was truncated by YAML into `/api`, colliding with another component's path while the duplicate-path guard compared the untruncated strings and saw nothing.",
+            "type": "string",
+            "pattern": "^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$"
+          },
+          "schedule": {
+            "description": "Five cron fields. 'every tuesday' rendered a CronJob the API server then rejected.",
+            "type": "string",
+            "pattern": "^(@(hourly|daily|weekly|monthly|yearly)|[-0-9*/,]+( +[-0-9*/,A-Za-z]+){4})$"
+          },
+          "timeZone": {
+            "description": "IANA zone for a cron `schedule`. Restricted to the IANA charset so an injected value cannot smuggle YAML into the CronJob spec.",
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9+._/-]{0,63}$"
+          },
+          "concurrencyPolicy": {
+            "description": "How a CronJob handles a run that starts while the previous is still going. Enumerated, not free text: an unquoted or injected value reaches the CronJob spec verbatim. 'Allow' is offered by Kubernetes but the agent plane refuses it upstream (a token-holding pod must not pile up); the chart still enumerates it for non-agent crons.",
+            "enum": ["Forbid", "Replace", "Allow"]
+          },
+          "restartPolicy": {
+            "description": "A cron pod's restart policy. Never = a failed run is a fresh Job attempt bounded by backoffLimit; OnFailure = the pod retries in place.",
+            "enum": ["Never", "OnFailure"]
+          },
+          "startingDeadlineSeconds": {
+            "description": "How long after a missed schedule a CronJob may still start a run. Bounded so a typo cannot render a value the API server rejects at apply time.",
+            "type": "integer",
+            "minimum": 0
+          },
+          "activeDeadlineSeconds": {
+            "description": "Job-level wall-clock cap on a scheduled run. Positive: 0 would kill the Job the instant it started. The agent plane derives it from the agent's task timeout.",
+            "type": "integer",
+            "minimum": 1
+          },
+          "backoffLimit": {
+            "description": "Job retry budget. 0 (no retries) is legitimate, which is why the chart reads it with hasKey rather than sprig `default`.",
+            "type": "integer",
+            "minimum": 0
+          },
+          "successfulJobsHistoryLimit": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "failedJobsHistoryLimit": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ttlSecondsAfterFinished": {
+            "type": "integer",
+            "minimum": 60
+          },
+          "singleton": {
+            "type": "boolean"
+          },
+          "readOnlyRootFilesystem": {
+            "type": "boolean"
+          },
+          "memory": {
+            "type": "string",
+            "pattern": "^[0-9]+(\\.[0-9]+)?(E|P|T|G|M|k|Ei|Pi|Ti|Gi|Mi|Ki)?$"
+          },
+          "memoryLimit": {
+            "type": "string",
+            "pattern": "^[0-9]+(\\.[0-9]+)?(E|P|T|G|M|k|Ei|Pi|Ti|Gi|Mi|Ki)?$"
+          },
+          "cpu": {
+            "type": "string",
+            "pattern": "^[0-9]+(\\.[0-9]+)?m?$"
+          },
+          "probePath": {
+            "description": "A probe URL, so a query string is legitimate here \u2014 unlike an Ingress `path`, which is a prefix match and must not contain '?'.",
+            "type": "string",
+            "pattern": "^/[A-Za-z0-9._~!$&'()*+,;=:@%/?-]*$"
+          },
+          "readinessPath": {
+            "description": "Optional readiness-only probe URL; when set the readinessProbe uses it while the livenessProbe keeps `probePath`, when absent both use `probePath`.",
+            "type": "string",
+            "pattern": "^/[A-Za-z0-9._~!$&'()*+,;=:@%/?-]*$"
+          },
+          "drain": {
+            "description": "This component's terminationGracePeriodSeconds, in seconds. Workers get the grace period and no preStop (they drain on SIGTERM). Web keeps the chart-level preStop sleep; this value must exceed drain.preStopSeconds. Cron is refused. Absent, the render is byte-identical to the chart-level drain (web) or to no grace period (everyone else).",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3600
+          },
+          "scratch": {
+            "description": "A memory-backed writable scratch directory for a component running with a read-only root filesystem. Renders one `emptyDir` volume with `medium: Memory`, mounted read-write at `mountPath`. The generator and the chart both refuse to render unless `memoryLimit` is set and strictly greater than `sizeLimit`: the volume is charged to the container's cgroup, and a sizeLimit at or above the limit is an OOMKill waiting for a real file.",
+            "type": "object",
+            "required": [
+              "mountPath",
+              "sizeLimit"
+            ],
+            "properties": {
+              "mountPath": {
+                "type": "string",
+                "pattern": "^/[A-Za-z0-9._/-]{1,255}$"
+              },
+              "sizeLimit": {
+                "description": "Maximum size of the memory-backed volume, as a Kubernetes quantity such as \"512Mi\". Required: without it the kubelet would let the volume grow until the pod is evicted.",
+                "type": "string",
+                "pattern": "^[0-9]+(\\.[0-9]+)?(E|P|T|G|M|k|Ei|Pi|Ti|Gi|Mi|Ki)?$"
+              }
+            }
+          },
+          "command": {
+            "description": "Container entrypoint override, one argv word per item.",
+            "type": "array",
+            "items": {"type": "string", "maxLength": 4096}
+          },
+          "args": {
+            "description": "Container arguments, one argv word per item.",
+            "type": "array",
+            "items": {"type": "string", "maxLength": 4096}
+          },
+          "hosts": {
+            "description": "Optional: bind the component's ingress path to a subset of the environment's hostnames (each must be one of `hostnames`).",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$"
+            }
+          },
+          "metrics": {
+            "type": "object",
+            "required": [
+              "port"
+            ],
+            "properties": {
+              "port": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535
+              },
+              "path": {
+                "description": "URL path Prometheus scrapes. Anchored and restricted to path characters: an unanchored `^/` accepted a newline, which reached the ServiceMonitor as sibling keys.",
+                "type": "string",
+                "pattern": "^/[A-Za-z0-9._~%/-]{0,255}$"
+              }
+            }
+          },
+          "replicas": {
+            "description": "sprig's `default` treats 0 as empty, so `replicas: 0` was silently rewritten to 1. Scale to zero is KEDA's job, not a typo's.",
+            "type": "integer",
+            "minimum": 1
+          },
+          "persistence": {
+            "type": "object",
+            "required": [
+              "mountPath"
+            ],
+            "properties": {
+              "mountPath": {
+                "type": "string",
+                "pattern": "^/[A-Za-z0-9._/-]{1,255}$"
+              },
+              "size": {
+                "type": "string",
+                "pattern": "^[0-9]+(Mi|Gi)$"
+              }
+            }
+          },
+          "env": {
+            "description": "Either a literal value or a reference to a key in a Kubernetes Secret. The reference names a Secret and never its producer, so SOPS and CNPG are interchangeable behind it. Names must be upper-case: Go parses YAML 1.1, so a bare `N`, `Y`, `ON` or `OFF` key becomes the boolean it looks like and reaches the container renamed to \"false\" or \"true\". Requiring upper case turns that silent rename into a render error, because a coerced key always lowercases.",
+            "type": "object",
+            "additionalProperties": {
+              "oneOf": [
+                {
+                  "type": [
+                    "string",
+                    "number",
+                    "boolean"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "secret": {
+                      "type": "string",
+                      "description": "Name of a Kubernetes Secret. Must appear in the top-level `secrets` list or the chart refuses to render."
+                    },
+                    "key": {
+                      "type": "string",
+                      "description": "Key within that Secret.",
+                      "pattern": "^[-._a-zA-Z0-9]+$"
+                    }
+                  },
+                  "required": [
+                    "secret",
+                    "key"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "propertyNames": {
+              "pattern": "^[A-Z_][A-Z0-9_]*$"
+            }
+          },
+          "configMap": {
+            "type": "object",
+            "required": [
+              "name",
+              "mountPath"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+              },
+              "mountPath": {
+                "type": "string",
+                "pattern": "^/[A-Za-z0-9._/-]{1,255}$"
+              },
+              "items": {
+                "description": "Project each key to its own path inside the mount, subdirectories included — how the agent plane mounts a skills library the runtime can discover (<skill>/SKILL.md). The kubelet rejects an absolute path or one containing '..', but only at apply time, long after the render reported success. The pattern forbids both STRUCTURALLY (a segment must start with an alphanumeric and dots only ever separate them) because Helm validates with Go's RE2, which has no lookahead — a '(?!\\.\\.)' guard here would not compile and would take every render down with it.",
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "key",
+                    "path"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "key": {
+                      "type": "string",
+                      "pattern": "^[-._a-zA-Z0-9]+$"
+                    },
+                    "path": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*(/[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*)*$"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "securityContext": {
+            "description": "Typed, because the root guard compares stringified values: `runAsUser: \"00\"` walked past it and died at the API server instead.",
+            "type": "object",
+            "properties": {
+              "runAsUser": {
+                "type": "integer"
+              },
+              "runAsGroup": {
+                "type": "integer"
+              },
+              "fsGroup": {
+                "type": "integer"
+              },
+              "runAsNonRoot": {
+                "type": "boolean"
+              },
+              "supplementalGroups": {
+                "type": "array",
+                "items": {
+                  "type": "integer"
+                }
+              },
+              "seccompProfile": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "enum": [
+                      "RuntimeDefault",
+                      "Localhost"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "envFromSecrets": {
+            "description": "Secret names pulled wholesale into the environment. A missing Secret here is skipped silently by the kubelet, so every name must be declared in the top-level `secrets` list.",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+            }
+          },
+          "language": {
+            "enum": [
+              "python",
+              "dotnet",
+              "nodejs",
+              "java"
+            ],
+            "description": "turns on OTel SDK injection via the operator webhook; go is deliberately absent (compile-time otelc, not the maintenance-mode inject-go agent)"
+          },
+          "configChecksum": {
+            "description": "A sha256 hex digest of the content of the ConfigMap this component mounts, stamped onto the pod template as the annotation `checksum/config`. Its only job is to make a content change a POD TEMPLATE change, so the workload rolls and a process that reads its config once at startup picks the new one up. Constrained to a bare digest rather than left free-form: the value reaches a pod annotation, and the one thing it may ever be is a hash the generator computed. Deterministic by construction — a timestamp here would make every re-render a diff and break the generated-file drift check.",
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "egress": {
+            "description": "The infrastructure this component may reach, by alias: `dns` is the cluster resolver, `postgres` is this tenant's own database, anything else is an org-specific address range the instance declares as egressTargets. A component that declares egress carries the orbit.local/egress label on its pods and leaves the namespace's open egress grant. Closed so `cidr:` for `cidrs:` fails here rather than rendering as no egress at all.",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "cidrs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "allOf": [
+          {
+            "description": "A cron with no schedule is a CronJob that never runs.",
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "cron"
+                }
+              },
+              "required": [
+                "kind"
+              ]
+            },
+            "then": {
+              "required": [
+                "schedule"
+              ]
+            }
+          },
+          {
+            "description": "A worker may be scraped \u2014 the chart renders it a metrics-only Service, because a ServiceMonitor selects Endpoints and one with no Service behind it scrapes nothing while reporting no error. A cron may not: its pod exists for seconds, so the target is absent almost always and any alert built on the metric is unfirable.",
+            "if": {
+              "required": [
+                "metrics"
+              ]
+            },
+            "then": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "web",
+                    "worker"
+                  ]
+                }
+              },
+              "required": [
+                "kind"
+              ]
+            }
+          },
+          {
+            "description": "readinessPath only splits the readiness probe: both probes are guarded by probePath, so readinessPath without probePath renders zero probes and is a silent no-op.",
+            "if": {
+              "required": [
+                "readinessPath"
+              ]
+            },
+            "then": {
+              "required": [
+                "probePath"
+              ]
+            }
+          },
+          {
+            "description": "drain is terminationGracePeriodSeconds; a CronJob's pod is gone by design, so a grace period there delays every schedule and protects nothing.",
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "cron"
+                }
+              },
+              "required": [
+                "kind"
+              ]
+            },
+            "then": {
+              "not": {
+                "required": [
+                  "drain"
+                ]
+              }
+            }
+          }
+        ]
+      }
+    },
+    "database": {
+      "description": "Presence renders a CloudNativePG Cluster plus a nightly pg_dump CronJob. Everything here is capacity; the credentials are the operator's to generate and are never expressible in this file.",
+      "type": "object",
+      "properties": {
+        "size": {
+          "type": "string",
+          "pattern": "^[0-9]+(Mi|Gi)$"
+        },
+        "memory": {
+          "type": "string",
+          "pattern": "^[0-9]+(\\.[0-9]+)?(E|P|T|G|M|k|Ei|Pi|Ti|Gi|Mi|Ki)?$"
+        },
+        "cpu": {
+          "type": "string",
+          "pattern": "^[0-9]+(\\.[0-9]+)?m?$"
+        },
+        "image": {
+          "description": "Tag included, unlike a component image: the Postgres major version is data-directory state, not a rolling tag, and pg_dump in the backup job is pinned to the same reference so it can never be older than the server.",
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._/-]{0,255}:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+        },
+        "backup": {
+          "type": "object",
+          "properties": {
+            "schedule": {
+              "type": "string",
+              "pattern": "^(@(hourly|daily|weekly|monthly|yearly)|[-0-9*/,]+( +[-0-9*/,A-Za-z]+){4})$"
+            },
+            "keep": {
+              "description": "Days of dumps to retain. Zero would delete every dump the moment it was written, including the one just taken.",
+              "type": "integer",
+              "minimum": 1
+            },
+            "size": {
+              "type": "string",
+              "pattern": "^[0-9]+(Mi|Gi)$"
+            },
+            "memory": {
+              "type": "string",
+              "pattern": "^[0-9]+(\\.[0-9]+)?(E|P|T|G|M|k|Ei|Pi|Ti|Gi|Mi|Ki)?$"
+            },
+            "timeZone": {
+              "description": "IANA zone for the backup `schedule`; the same charset rule as a component's timeZone.",
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9+._/-]{0,63}$"
+            }
+          },
+          "additionalProperties": false
+        },
+        "archiveGeneration": {
+          "type": "integer",
+          "minimum": 2,
+          "description": "bump after a disaster recovery \u2014 barman refuses a non-empty archive path, so a recreated cluster writes under /genN"
+        },
+        "parameters": {
+          "description": "Postgres GUC name \u2192 string, rendered as spec.postgresql.parameters. Keys must match ^[a-z_]+$; the two the product sets are max_connections and shared_buffers. Absent: no postgresql block, so the Cluster stays byte-identical to a database that never named parameters.",
+          "type": "object",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[a-z_]+$": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "secrets": {
+      "description": "Every Kubernetes Secret this service's pods may reference. The chart creates none of them: every entry only declares a Secret the sops plane produces, which is what the render-time guard checks env references against.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+          },
+          "keys": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[-._a-zA-Z0-9]+$"
+            }
+          },
+          "from": {
+            "type": "string",
+            "default": "sops",
+            "enum": [
+              "sops",
+              "external"
+            ]
+          },
+          "refreshInterval": {
+            "type": "string",
+            "pattern": "^[0-9]+(s|m|h)$"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "drain": {
+      "description": "Graceful-roll budget for the components that sit behind an Ingress and roll. Both values reach a pod spec, so both are bounded here rather than trusted: an out-of-range or non-integer sleep is rejected by the API server at APPLY time, which under auto-sync is a chart that renders green and a Deployment that never updates again.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "preStopSeconds": {
+          "description": "How long a terminating pod keeps serving before it is sent SIGTERM, covering the lag between endpoint removal and the routers noticing. At least 1: a 0-second sleep is a hook that renders as if it protects the roll and does not.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300
+        },
+        "gracePeriodSeconds": {
+          "description": "terminationGracePeriodSeconds. Must exceed preStopSeconds (the template refuses to render otherwise) — it is one wall clock covering the sleep AND the app's shutdown after SIGTERM.",
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 3600
+        }
+      }
+    },
+    "rbac": {
+      "description": "Generator-only. Names the ONE component allowed a Kubernetes API right on this platform — the agent plane's intake, which creates a one-shot Job per event. It is a root value and never a component key on purpose: component dicts pass through from catalog/projects.yaml, so a component key would let a hand-written catalog project mint itself a Role. The grant is fixed in templates/rbac.yaml (batch/jobs, create+get, namespaced) and is not expressible here.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jobRunner": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,20}[a-z0-9])?$"
+        }
+      }
+    },
+    "s3": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bucket": {
+          "description": "S3 bucket name; anchored so a newline cannot reach the ObjectStore's destinationPath.",
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9.-]{1,61}[a-z0-9])?$"
+        },
+        "endpoint": {
+          "type": "string",
+          "pattern": "^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/?$"
+        },
+        "retention": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*[dwm]$"
+        }
+      },
+      "dependencies": {
+        "bucket": [
+          "endpoint"
+        ],
+        "endpoint": [
+          "bucket"
+        ]
+      }
+    }
+  }
+}

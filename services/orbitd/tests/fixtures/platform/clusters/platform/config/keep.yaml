@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keep-cm
+data:
+  k: v
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: nested-app
+spec:
+  source:
+    path: ignored
+  destination:
+    namespace: nowhere

@@ -1,0 +1,211 @@
+# The Orbit instance configuration — the ONE file that makes this instance this instance.
+#
+# Everything org-specific lives here: the core never carries an instance string, and a
+# verify check enforces that by grepping the core for the values in this file. A new org
+# is this file filled in (plus its projects.yaml and the SOPS bootstrap key), nothing
+# else. Consumed by the generator, the verify suite, tofu, and the bootstrap script.
+
+instance:
+  name: example                       # short id; prefixes global names (buckets, etc.)
+
+git:
+  # The instance repo Argo pulls generated manifests from.
+  repoUrl: git@github.com:example-org/example-instance.git
+  branch: main
+  github_org: example-org            # where the GitHub App gets installed
+
+domains:
+  # Every exposed project renders on the primary by default; `domains:` in a catalog
+  # entry narrows. devDomain hosts non-prod environments behind basic auth.
+  primary: example.org
+  dev: dev.example.org
+  # Zones we hold DNS credentials for (DNS-01 wildcard certs work inside these).
+  dnsZones: [example.org]
+
+# Where this org's application images live, and it must be ghcr.io/<git.github_org>,
+# lowercased — `make init` refuses anything else. Images are built on the operator
+# machine and pushed to the org's own ghcr.io owner, while the catalog's `image:` is
+# written from this line; two owners here is an org with real images and deploys that
+# never happen.
+registry: ghcr.io/example-org
+
+# The CORE repo's owner, and the hand-pinned tags of the core images an instance runs
+# directly. Core's images are published under the core repo's owner rather than the org's,
+# so this is an org-shaped string and belongs here — the generator and the template carry
+# none by design (docs/PRODUCT.md, "the core carries no instance strings").
+# The images must be pullable by this instance's ghcr-pull token: make the core packages
+# public, or grant the token read access, or the control surface ImagePullBackOffs.
+coreRegistry:
+  owner: ghcr.io/example-core-org
+  # The control surface (MCP server): a core release tag. `make verify` stage6 checks
+  # the running pod and its /healthz against this pin, so a bump that is committed but
+  # never applied (`orbit platform apply --app platform-config`) goes red.
+  orbitdTag: v1.0.0
+  # The desk image scripts/desk.sh runs (kubectl, helm, sops, age, promtool, tofu, orbit).
+  deskTag: v1.0.0
+
+# orbitd applies what the catalog declares: every ship, rollback and restart ends in its apply,
+# and it re-applies every period. `on` is what an Orbit instance runs with; a platform
+# onboarded with it off can ship nothing and has no tool that turns it on (met on the
+# rebuilt test box, docs/V1.md §8). With the block left out altogether the applier is
+# `off` (the value an instance had while something else still applied its Applications).
+# Quote on/off: unquoted, YAML parses them as booleans.
+orbitd:
+  applyMode: "on"
+  reconcilePeriodS: 180
+# orbitd.applyPairs: [] — empty (the default) means every catalog pair. A non-empty list of
+#   project/env strings (e.g. [demo/dev]) turns the applier on only for those pairs; catalog-sync writes their Application under clusters/orbit/ so ArgoCD's prune drops it.
+
+# The agent plane's runtime image (the AGENT-PLANE.md record, D.1/D.2; a removed record:
+# docs/README.md in orbit-core, "Retired design records", says how to read one). Core builds
+# it once for every instance and publishes it under the CORE repo's owner — so the
+# reference is an org-shaped string and lives here rather than in the generator, which
+# carries no instance strings by design. This is the ONE pin for the whole plane — every
+# agent runs exactly this image; there is no per-agent override, so no catalog entry can
+# point an agent (and the subscription token mounted into it) at another registry.
+# Required only once an agent is declared. Pin the tag: `main` moves. The image must be
+# pullable by the instance's ghcr-pull token — make the core package public or grant the
+# instance token read access, or every agent ImagePullBackOffs (ONBOARDING §8).
+agentRuntime:
+  image: ghcr.io/example-core-org/orbit-agent-runtime
+  tag: main-0000000
+
+# The intake image — the agent plane's event router (Phase D.3). Same story as
+# agentRuntime and for a sharper reason: this one process holds all three source
+# credentials AND every warm agent's bearer, and it may create Jobs in the namespace that
+# mounts the subscription token. One instance pin, no per-agent and no per-catalog
+# override. Required only once some agent declares `triggers:`; without one the router is
+# not rendered at all and the plane costs nothing for it.
+#
+# It needs three sops-sealed (prod) keys before the first event, or that source refuses 503:
+#   INTAKE_ALERTMANAGER_TOKEN  bearer Alertmanager presents (its http_config bearer_token)
+#   INTAKE_GITHUB_SECRET       the GitHub webhook secret, verified as X-Hub-Signature-256
+#   INTAKE_A2A_TOKEN           bearer an operator or another agent presents to POST /a2a/<agent>
+intakeRuntime:
+  image: ghcr.io/example-core-org/orbit-intake
+  tag: main-0000000
+
+# The Loki ruler, declared wired. ABSENT by default and only ever set to `wired`. It is a
+# statement that this instance's Loki ruler reads the generated rule ConfigMaps and
+# notifies Alertmanager. The template's own Loki application does both wherever the logs
+# feature is on (clusters/platform/apps/loki.yaml: rulerConfig, and the two ConfigMaps
+# mounted into /etc/loki/rules/fake), so:
+#   * a log MONITOR (orbit_monitor_upsert, kind: log) needs nothing here: orbitd reads
+#     that file and accepts the monitor when the wiring is in it (docs/MONITORS.md);
+#   * an agent `logs` TRIGGER (the agent plane) is refused by the generator until this
+#     line is written, on purpose: it renders a live intake route in front of the rule.
+# Declaring it with the logs feature off is refused by `make init`: there is no Loki.
+# lokiRuler: wired
+
+# The intake's PUBLIC webhook door, declared wired (the AGENT-PLANE.md record, "the `github`
+# gate"). ABSENT by default and only ever set to `wired`. The generator renders a `github`
+# trigger's intake ROUTE and never the DOOR, since the router holds every warm agent's
+# bearer and can create Jobs — so the flag is the instance ATTESTING that both halves of
+# the door exist: (1) an Ingress whose host reaches the intake Service, PATH-SCOPED to
+# /webhook/github alone (the intake's GET /healthz and /metrics are its only
+# unauthenticated routes and must stay unpublished), and (2) a NetworkPolicy admitting the
+# ingress controller's pods to the intake pods' port, pod-narrowed on BOTH sides in one
+# from-element.
+#
+# The two halves ship in the template, staged under provisioning/, so an org wiring the
+# door does not copy them out of another org's repository — and `make init` RENDERS them
+# only while this flag says `wired`, and DELETES them when it does not. So the attestation
+# and the artifact cannot disagree: leave this commented out and a fresh org has no public
+# webhook Ingress at all, which is the fail-closed default. `wired` is the only accepted
+# value; a typo is refused at generation rather than read as "not wired".
+# intakeIngress: wired
+
+nodes:
+  # The org's servers, as tofu builds them (ONBOARDING §3): size and place live here
+  # as `serverType`/`location`, and the created address goes into `ip`.
+  #
+  # ORDERING: ONBOARDING §1 runs `make init` BEFORE tofu creates the server in §3 —
+  # so the address below is a GUESS. That is fine and expected: put tofu's real
+  # address here after §3 and re-run `make init`.
+  - name: org-node-1
+    ip: 203.0.113.10
+    role: control-plane
+    # Optional: hetzner (the default when absent) or owned. The loader exports
+    # it as ORBIT_NODE_PROVIDER for the control-plane node.
+    provider: hetzner
+
+secrets:
+  # sops is the only secret plane: every Secret comes from a SopsSecret the desk
+  # applies (clusters/platform/secrets/<ns>/<name>.yaml). Anything else is refused
+  # by `make init` before anything is written.
+  provider: sops
+  # Environment slugs the plane seals secrets for; exactly these two.
+  environments: [dev, prod]
+
+# Per-component egress allowlist (phase 9, CIDR half). A catalog component may declare
+# `egress: {cidrs: [postgres, s3, dns]}` and then reaches those addresses and nothing
+# else. `dns` (the cluster resolver) and `postgres` (this tenant's own database pods)
+# are built in; every other alias is declared here, as this org's own address ranges,
+# because the core carries no org's addresses. An alias nobody declares is refused at
+# generation, never rendered empty. A target must be a CIDR, must not be 0.0.0.0/0
+# (that narrows nothing), and must not cover 169.254.0.0/16 (the node metadata
+# service, which serves the node's root password). Hostnames are NOT expressed here —
+# they are served by the shared egress proxy (next phase); `egress.hosts` is refused
+# until it exists.
+# egressTargets:
+#   s3: [198.51.100.0/24]
+
+objectStorage:
+  # Phase B: the observability/backup bucket set. Names are globally unique on Hetzner,
+  # so they carry the instance name prefix.
+  provider: hetzner
+  # The S3 API endpoint of the region the buckets live in. REQUIRED whenever
+  # buckets.platform is declared — init refuses the pair-with-a-hole rather than
+  # scaffold Loki and Tempo against a store they cannot address. Loki takes it whole;
+  # Tempo's s3 config wants the HOST, so init derives a schemeless
+  # `objectStorage.endpointHost` from this one spelling rather than have the file carry
+  # two that can drift. Drop the whole objectStorage block for a bucket-less orbit.
+  endpoint: https://fsn1.your-objectstorage.com
+  buckets:
+    platform: example-orbit-platform   # Loki/Tempo/backups own this — never app data
+    appData: example-orbit-apps        # folder per service per environment
+
+# The optional parts of the platform. `core` (the doors and certificates, sealed secrets,
+# metrics and alerts, orbitd) always runs; each feature below is extra and costs memory.
+# provisioning/features.yaml describes every feature: what it gives, what it needs, what
+# it costs.
+#
+#   * With this block: exactly the features set to `true` run. One left out is off, and
+#     `features: {}` is the smallest platform.
+#   * Without this block: every feature whose needs are met runs (logs and traces need
+#     objectStorage.buckets.platform), which is what an instance rendered before
+#     features existed.
+#
+# `make init` refuses a feature turned on without what it needs, by name.
+# features:
+#   logs: true              # pod logs kept 7 days in Loki; needs a bucket
+#   traces: false           # request traces in Tempo; needs a bucket
+#   dashboards: true        # Grafana, with a dashboard per project environment
+#   uptime: true            # every public door checked from outside once a minute
+#   databases: true         # a project may declare a PostgreSQL database
+#   backups: true           # a prod database archives to the bucket; needs a bucket and databases
+#   alerts-telegram: true   # alerts are also sent to the chat in contacts.telegramChatId
+
+contacts:
+  # Needed (true, with telegramChatId) while the alerts-telegram feature is on.
+  telegram: true                     # bot token comes from the sops-sealed Secret, not here
+  # The instance admin's display name.
+  adminFirstName: Ada
+  adminLastName: Admin
+  # The chat the alert receiver posts to (an id, not a secret — the bot token is the
+  # credential). Required while the alerts-telegram feature is on.
+  telegramChatId: "111111111"
+  # ACME registration email for Let's Encrypt certificates.
+  email: ops@example.org
+
+# Extra static blackbox targets, beyond the platform doors the template ships and the
+# per-project probes catalog-sync generates. Each entry is a {url, module} pair; module
+# is a blackbox-exporter module this instance runs (`http_2xx`, `http_401`). Absent or
+# an empty list keeps the template's probes only. `url` may use the same {{tokens}}
+# clusters/ does ({{domains.primary}}, {{domains.dev}}).
+# monitoring:
+#   probes:
+#     - url: https://app.example.org/v1
+#       module: http_2xx
+#     - url: https://app.dev.example.org
+#       module: http_401

@@ -1,0 +1,119 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# The alert recorder: an Alertmanager webhook receiver that writes one JSON line per
+# alert per notification to stdout — `{"recorded": "alertmanager", "status", "startsAt",
+# "endsAt", and every label}` — so Alloy ships it to Loki and a test
+# (docs/V1.md §6.3) can prove an alert was DELIVERED, not just firing, with
+# `{namespace="monitoring", container="alert-recorder"} |= "<alertname>"`.
+#
+# Labels only: annotations (summary, description) are never written, so no alert text
+# reaches the log store through it. Alertmanager reaches it as a second integration on
+# the human `telegram` receiver (kube-prometheus-stack.yaml), so the record is exactly
+# what reached a human and recording never changes who is paged. Only Alertmanager may
+# POST to it (the NetworkPolicy below): a tenant cannot plant a record.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alert-recorder
+  namespace: monitoring
+  labels: {app.kubernetes.io/name: alert-recorder, app.kubernetes.io/part-of: orbit}
+data:
+  recorder.py: |
+    import json, sys
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Recorder(BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(min(n, 1 << 20)) or b"{}")
+                for a in body.get("alerts") or []:
+                    labels = a.get("labels") or {}
+                    # every label (pod, service, job... name WHICH thing alerted), and the
+                    # record's own keys win over a label of the same name
+                    rec = {str(k): str(v) for k, v in labels.items()}
+                    rec.update({"recorded": "alertmanager", "status": a.get("status"),
+                                "startsAt": a.get("startsAt"), "endsAt": a.get("endsAt")})
+                    print(json.dumps(rec, sort_keys=True), flush=True)
+                self.send_response(200)
+            except ValueError:
+                self.send_response(400)
+            self.end_headers()
+
+        def do_GET(self):  # readiness
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):  # no access log: one line per alert is the record
+            pass
+
+    HTTPServer(("", 8080), Recorder).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alert-recorder
+  namespace: monitoring
+  labels: {app.kubernetes.io/name: alert-recorder, app.kubernetes.io/part-of: orbit}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: alert-recorder}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: alert-recorder, app.kubernetes.io/part-of: orbit}
+    spec:
+      priorityClassName: orbit-platform
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: alert-recorder
+          image: python:3.13-alpine
+          command: ["python", "-u", "/app/recorder.py"]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe:
+            httpGet: {path: /, port: http}
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 5m, memory: 24Mi}
+            limits: {memory: 48Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: app, mountPath: /app, readOnly: true}
+      volumes:
+        - name: app
+          configMap: {name: alert-recorder}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alert-recorder
+  namespace: monitoring
+  labels: {app.kubernetes.io/name: alert-recorder, app.kubernetes.io/part-of: orbit}
+spec:
+  selector: {app.kubernetes.io/name: alert-recorder}
+  ports: [{name: http, port: 8080, targetPort: http}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: alert-recorder-ingress
+  namespace: monitoring
+  labels: {app.kubernetes.io/part-of: orbit}
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: alert-recorder}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: alertmanager}
+      ports: [{protocol: TCP, port: 8080}]

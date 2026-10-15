@@ -1,0 +1,82 @@
+# Paths an instance repo vendors from orbit-core, at the version pinned in its
+# orbit-core.lock. scripts/core-sync.sh reads this list. One path per line;
+# directories are synced recursively; lines starting with # are ignored.
+#
+# `<core path> -> <instance path>` when the two differ. That is the exception, not the
+# shape: it exists for a file that also has to SEED a new org from template/ (which a new
+# org gets by copying that tree wholesale) while still reaching an org that already
+# exists. Only a config-free file may be listed this way — vendoring overwrites, so
+# anything instance-init.py renders would have its rendering thrown away on every pin bump.
+#
+# The list vendors ITSELF, so an instance repo carries the record of what it took from
+# core. scripts/verify/no-instance-strings.py derives its scope from this file and runs
+# inside the instance (from stage3), so without this line the oracle has nothing to read
+# there and fails closed — and, separately, an operator asking "is this file mine or
+# core's?" can answer it from the repo in front of them.
+core-manifest.txt
+charts/service
+scripts/catalog-sync.py
+scripts/bump-tag.py
+scripts/bump-and-push.sh
+scripts/core-same.py
+scripts/github-app-token.py
+scripts/ship.sh
+scripts/monitor-commit.sh
+scripts/features-commit.sh
+scripts/catalog-commit.sh
+scripts/catalog-edit.py
+scripts/lib-app-clone.sh
+scripts/assert-deployed.sh
+scripts/bootstrap-node.sh
+scripts/lib-instance.sh
+scripts/no-credentials.py
+scripts/pitr-drill.sh
+scripts/pitr-restore.sh
+scripts/db-backup.sh
+scripts/db-restore.sh
+scripts/remove-project.sh
+scripts/wait-applied.sh
+scripts/core-sync.sh
+scripts/desk.sh
+scripts/verify/am-inline-credentials.py
+scripts/verify/am-routes.py
+scripts/verify/shown.py
+scripts/verify/orbit_features.py
+scripts/verify/no-instance-strings.py
+scripts/verify/stage2.sh
+scripts/verify/stage3.sh
+scripts/verify/stage4.sh
+# Sorts between stage4.sh and an instance's own stage5.sh in `scripts/verify/stage*.sh`
+# glob order, under both the C and the en_US collations. See the file's header for why
+# it is not called stage5.sh: the instance keeps its own tenant stages and vendors this
+# one without renaming anything.
+scripts/verify/stage5-platform.sh
+scripts/verify/stage6-live.sh
+scripts/verify/stage7-scenarios.sh
+scripts/verify/guardrails.py
+tofu/dns.tf
+tofu/firewall.tf
+tofu/outputs.tf
+tofu/server.tf
+tofu/variables.tf
+tofu/versions.tf
+.claude/skills/orbit-start
+.claude/skills/orbit-onboard
+.claude/skills/orbit-develop
+.claude/skills/orbit-ship
+.claude/skills/orbit-observe
+# The operator skills: procedures for an AGENT holding an orbitd token (docs/SKILLS.md),
+# as opposed to the .claude/skills above, which are for a person editing the repo. Vendored
+# so an org's own hosts can load them, and listed here so the leak oracle checks them.
+skills
+# The swarm skill under .claude/skills is deliberately NOT here. It is the operating
+# manual for BUILDING orbit-core — agent swarms driven by the verify suite — not for
+# running an instance, so it left the vendored set on 2026-09-07. It stays in this repo
+# for core builders and docs/METHOD.md points at it. Dropping it here also drops it from
+# the leak oracle's scope, which is derived from this file.
+scripts/instance-init.py
+# The unrendered source tree clusters/ is rendered FROM. Config-free: every file
+# under it still carries its {{tokens}}, and scripts/instance-init.py renders them
+# into clusters/ on every run — so vendoring it can never throw away a rendering
+# the way a rendered tree would on every pin bump.
+template/provisioning -> provisioning

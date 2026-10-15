@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: plugin
+  labels:
+    app.kubernetes.io/instance: classes
+type: Opaque
+data:
+  SIDECAR_IMAGE: cGxhY2Vob2xkZXI=

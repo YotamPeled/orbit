@@ -1,0 +1,13 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# orbitd: the control surface (MCP server + token issuer). Its own namespace so the
+# signing key, principal store and revocation list do not share a blast radius with
+# the webhook receiver or the auth plane.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: orbit
+  labels:
+    orbit.local/component: platform

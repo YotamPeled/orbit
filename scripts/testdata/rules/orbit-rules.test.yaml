@@ -1,0 +1,568 @@
+# promtool unit tests for the platform alert rules
+# (template/provisioning/clusters/platform/monitoring/rules.yaml, docs/V1.md §6.3).
+# scripts/test_rules_promtool.py extracts the PrometheusRule's spec.groups into
+# orbit-rules.yaml beside this file and runs `promtool test rules` over it; the same test
+# refuses a rule that no case below names. Each rule has a case where it fires and, where
+# the rule's own scoping is the point, a case where it must not.
+rule_files: [orbit-rules.yaml]
+evaluation_interval: 1m
+
+tests:
+  # ── node disk ────────────────────────────────────────────────────────────────────────
+  - name: disk at 20% free warns after 30m, not before; 40% free never does
+    interval: 1m
+    input_series:
+      - series: node_filesystem_avail_bytes{mountpoint="/",fstype="ext4",instance="n1"}
+        values: "20x40"
+      - series: node_filesystem_size_bytes{mountpoint="/",fstype="ext4",instance="n1"}
+        values: "100x40"
+      - series: node_filesystem_avail_bytes{mountpoint="/",fstype="ext4",instance="n2"}
+        values: "40x40"
+      - series: node_filesystem_size_bytes{mountpoint="/",fstype="ext4",instance="n2"}
+        values: "100x40"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: NodeDiskLow
+        exp_alerts: []
+      - eval_time: 31m
+        alertname: NodeDiskLow
+        exp_alerts:
+          - exp_labels: {severity: warning, mountpoint: "/", fstype: ext4, instance: n1}
+            exp_annotations:
+              description: "n1 has 20% of its root filesystem free. Images, local-path volumes and container logs all live here; find what grew before it decides for you."
+              summary: "Node root filesystem below 30% free"
+      - eval_time: 31m
+        alertname: NodeDiskCritical
+        exp_alerts: []
+
+  - name: disk at 10% free is critical after 10m
+    interval: 1m
+    input_series:
+      - series: node_filesystem_avail_bytes{mountpoint="/",fstype="ext4",instance="n1"}
+        values: "10x20"
+      - series: node_filesystem_size_bytes{mountpoint="/",fstype="ext4",instance="n1"}
+        values: "100x20"
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: NodeDiskCritical
+        exp_alerts:
+          - exp_labels: {severity: critical, mountpoint: "/", fstype: ext4, instance: n1}
+            exp_annotations:
+              description: "n1 is close to full. Kubelet eviction and image GC thresholds are near; production pods will be evicted if this continues."
+              summary: "Node root filesystem below 15% free"
+
+  # ── workloads ────────────────────────────────────────────────────────────────────────
+  - name: a platform container restarting 4 times in 15m is a crash loop; a dev tenant is not paged
+    interval: 1m
+    input_series:
+      - series: kube_pod_container_status_restarts_total{namespace="monitoring",pod="prom-0",container="prometheus"}
+        values: "0x10 1 2 3 4 4x30"
+      - series: kube_pod_container_status_restarts_total{namespace="demo-dev",pod="api-0",container="api"}
+        values: "0x10 1 2 3 4 4x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PlatformContainerRestarted
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: monitoring, pod: prom-0, container: prometheus}
+            exp_annotations:
+              description: "A container that was already running has either restarted more than twice in 15 minutes (a crash-loop) or restarted with its last termination at exit 137 — an OOMKill this kubelet labels reason=Error, so the pager cannot name it, but the exit code can. It may be back Ready now, which is why nothing else noticed. Check the pod's lastState.terminated and its memory ceiling."
+              summary: "monitoring/prom-0: container prometheus is restarting (crash-loop or OOM)"
+
+  - name: one restart ending at exit 137 is an OOM kill and pages
+    interval: 1m
+    input_series:
+      - series: kube_pod_container_status_restarts_total{namespace="demo-prod",pod="api-0",container="api"}
+        values: "0x10 1x30"
+      - series: kube_pod_container_status_last_terminated_exitcode{namespace="demo-prod",pod="api-0",container="api"}
+        values: "137x40"
+    alert_rule_test:
+      - eval_time: 17m
+        alertname: PlatformContainerRestarted
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: demo-prod, pod: api-0, container: api}
+            exp_annotations:
+              description: "A container that was already running has either restarted more than twice in 15 minutes (a crash-loop) or restarted with its last termination at exit 137 — an OOMKill this kubelet labels reason=Error, so the pager cannot name it, but the exit code can. It may be back Ready now, which is why nothing else noticed. Check the pod's lastState.terminated and its memory ceiling."
+              summary: "demo-prod/api-0: container api is restarting (crash-loop or OOM)"
+
+  # 256Mi limit (268435456); 245Mi (256901120) is 95.7% of it, 100Mi (104857600) is 39%
+  - name: a tenant container above 90% of its memory limit for 15m is at its limit, and says whose it is
+    interval: 1m
+    input_series:
+      # two series for one container, as cAdvisor leaves after a restart: no duplicate match
+      - series: container_memory_working_set_bytes{namespace="demo-prod",pod="api-0",container="api",id="/a"}
+        values: "256901120x40"
+      - series: container_memory_working_set_bytes{namespace="demo-prod",pod="api-0",container="api",id="/b"}
+        values: "104857600x40"
+      - series: container_memory_working_set_bytes{namespace="demo-prod",pod="api-0",container="",id="/pod"}
+        values: "256901120x40"
+      - series: kube_pod_container_resource_limits{namespace="demo-prod",pod="api-0",container="api",resource="memory"}
+        values: "268435456x40"
+      - series: kube_pod_container_resource_limits{namespace="demo-prod",pod="api-0",container="api",resource="cpu"}
+        values: "1x40"
+      - series: kube_namespace_labels{namespace="demo-prod",label_orbit_local_project="demo",label_orbit_local_env="prod"}
+        values: "1x40"
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: OrbitWorkloadMemoryAtLimit
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: OrbitWorkloadMemoryAtLimit
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: demo-prod, pod: api-0, container: api, project: demo, env: prod, component: api}
+            exp_annotations:
+              description: "api in demo-prod has used more than 90% of its memory limit for 15 minutes (95.7% now) and has not been killed. It has no room left: its next allocation fails or gets it killed. Look at its error rate, then ask orbit_size_recommend for this project and environment."
+              summary: "demo-prod/api-0: api is at its memory limit"
+
+  - name: five minutes above 90% of the limit is a spike, not a workload at its limit
+    interval: 1m
+    input_series:
+      - series: container_memory_working_set_bytes{namespace="demo-prod",pod="api-0",container="api"}
+        values: "104857600x10 256901120x4 104857600x30"
+      - series: kube_pod_container_resource_limits{namespace="demo-prod",pod="api-0",container="api",resource="memory"}
+        values: "268435456x45"
+      - series: kube_namespace_labels{namespace="demo-prod",label_orbit_local_project="demo",label_orbit_local_env="prod"}
+        values: "1x45"
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: OrbitWorkloadMemoryAtLimit
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: OrbitWorkloadMemoryAtLimit
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: OrbitWorkloadMemoryAtLimit
+        exp_alerts: []
+    promql_expr_test:
+      # it did go pending during the spike and never fired
+      - expr: count_over_time(ALERTS{alertname="OrbitWorkloadMemoryAtLimit",alertstate="firing"}[45m])
+        eval_time: 45m
+        exp_samples: []
+
+  - name: a container with no memory limit, one at 90% exactly, and a platform container are not at a limit
+    interval: 1m
+    input_series:
+      # no limit declared: nothing to be at
+      - series: container_memory_working_set_bytes{namespace="demo-prod",pod="free-0",container="free"}
+        values: "5000000000x40"
+      - series: kube_pod_container_resource_limits{namespace="demo-prod",pod="free-0",container="free",resource="cpu"}
+        values: "1x40"
+      # 90% of 1000 exactly: the rule is strictly above
+      - series: container_memory_working_set_bytes{namespace="demo-prod",pod="edge-0",container="edge"}
+        values: "900x40"
+      - series: kube_pod_container_resource_limits{namespace="demo-prod",pod="edge-0",container="edge",resource="memory"}
+        values: "1000x40"
+      - series: kube_namespace_labels{namespace="demo-prod",label_orbit_local_project="demo",label_orbit_local_env="prod"}
+        values: "1x40"
+      # a platform store full to its limit: not a tenant, and it has its own budget alert
+      - series: container_memory_working_set_bytes{namespace="loki",pod="loki-0",container="loki"}
+        values: "256901120x40"
+      - series: kube_pod_container_resource_limits{namespace="loki",pod="loki-0",container="loki",resource="memory"}
+        values: "268435456x40"
+      - series: kube_namespace_labels{namespace="loki"}
+        values: "1x40"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: OrbitWorkloadMemoryAtLimit
+        exp_alerts: []
+
+  - name: a namespace whose env label is not exported yet still alerts, naming the project
+    interval: 1m
+    input_series:
+      - series: container_memory_working_set_bytes{namespace="demo-dev",pod="api-0",container="api"}
+        values: "256901120x40"
+      - series: kube_pod_container_resource_limits{namespace="demo-dev",pod="api-0",container="api",resource="memory"}
+        values: "268435456x40"
+      - series: kube_namespace_labels{namespace="demo-dev",label_orbit_local_project="demo"}
+        values: "1x40"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: OrbitWorkloadMemoryAtLimit
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: demo-dev, pod: api-0, container: api, project: demo, component: api}
+            exp_annotations:
+              description: "api in demo-dev has used more than 90% of its memory limit for 15 minutes (95.7% now) and has not been killed. It has no room left: its next allocation fails or gets it killed. Look at its error rate, then ask orbit_size_recommend for this project and environment."
+              summary: "demo-dev/api-0: api is at its memory limit"
+
+  # ── public surfaces ──────────────────────────────────────────────────────────────────
+  - name: a probe failing for 3 minutes is a site down
+    interval: 1m
+    input_series:
+      - series: probe_success{instance="https://demo.example.org",job="platform-probes"}
+        values: "1 1 0x10"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: OrbitSiteDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: OrbitSiteDown
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: "https://demo.example.org", job: platform-probes}
+            exp_annotations:
+              description: "The public URL has failed its check for three minutes. This is measured from outside the cluster, so the cause may be DNS, the certificate, Traefik or the pod itself — the dashboards for that service say which."
+              summary: "https://demo.example.org is not answering"
+
+  - name: a certificate 10 days from expiry warns after an hour
+    interval: 1m
+    input_series:
+      - series: probe_ssl_earliest_cert_expiry{instance="https://demo.example.org",job="platform-probes"}
+        values: "864000x70"
+    alert_rule_test:
+      - eval_time: 61m
+        alertname: OrbitCertificateExpiringSoon
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: "https://demo.example.org", job: platform-probes}
+            exp_annotations:
+              description: "cert-manager renews at 30 days remaining, so reaching 14 means renewal has been failing for a fortnight. Check the Certificate and Order objects in the traefik namespace."
+              summary: "TLS certificate for https://demo.example.org expires in under 14 days"
+
+  # ── backups ──────────────────────────────────────────────────────────────────────────
+  - name: WAL segments piling up un-archived for 15m is critical
+    interval: 1m
+    input_series:
+      - series: cnpg_collector_pg_wal_archive_status{value="ready",namespace="demo-prod",pod="demo-db-1"}
+        values: "3x20"
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: OrbitWALArchiveStalled
+        exp_alerts:
+          - exp_labels: {severity: critical, value: ready, namespace: demo-prod, pod: demo-db-1}
+            exp_annotations:
+              description: "WAL archiving to object storage has stalled. Un-archived segments are accumulating on the data volume; when it fills, Postgres stops accepting writes. Check the orbit-s3 credential and the bucket, then the cluster's ContinuousArchiving condition."
+              summary: "demo-prod: WAL segments are piling up un-archived"
+
+  - name: failing archive commands warn
+    interval: 1m
+    input_series:
+      - series: cnpg_pg_stat_archiver_failed_count{namespace="demo-prod",pod="demo-db-1"}
+        values: "0x5 1+1x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: OrbitWALArchiveFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: demo-prod, pod: demo-db-1}
+            exp_annotations:
+              description: "barman-cloud-wal-archive is returning errors. Archiving may still limp along, but every failure is retried WAL held on local disk."
+              summary: "demo-prod: WAL archive commands are failing"
+
+  # ── capacity ─────────────────────────────────────────────────────────────────────────
+  - name: 95% of a node's memory requested for 15m warns
+    interval: 1m
+    input_series:
+      - series: cluster:namespace:pod_memory:active:kube_pod_container_resource_requests{node="n1",namespace="a"}
+        values: "950x20"
+      - series: kube_node_status_allocatable{node="n1",resource="memory"}
+        values: "1000x20"
+      - series: cluster:namespace:pod_cpu:active:kube_pod_container_resource_requests{node="n1",namespace="a"}
+        values: "1x20"
+      - series: kube_node_status_allocatable{node="n1",resource="cpu"}
+        values: "8x20"
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: OrbitNodeReservationHigh
+        exp_alerts:
+          - exp_labels: {severity: warning, node: n1}
+            exp_annotations:
+              description: "The sum of container requests on this node is above 90% of its allocatable memory or cpu. Nothing has failed yet, but the next scale-up or deploy may not schedule. Shed load, grow the node, or lower requests that were set as backstops rather than budgets."
+              summary: "Node n1 has over 90% of memory or cpu requested"
+
+  - name: 10% 5xx at 1 req/s warns after 10m; the same ratio at a trickle does not
+    interval: 1m
+    input_series:
+      - series: traefik_service_requests_total{service="demo-prod-web@kubernetes",code="500"}
+        values: "0+6x30"
+      - series: traefik_service_requests_total{service="demo-prod-web@kubernetes",code="200"}
+        values: "0+54x30"
+      - series: traefik_service_requests_total{service="quiet@kubernetes",code="500"}
+        values: "0+0.3x30"
+      - series: traefik_service_requests_total{service="quiet@kubernetes",code="200"}
+        values: "0+2.7x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: OrbitIngress5xxRateHigh
+        exp_alerts:
+          - exp_labels: {severity: warning, service: "demo-prod-web@kubernetes"}
+            exp_annotations:
+              description: "More than 5% of this Traefik service's responses over the last 5 minutes are 5xx, at a traffic level where the ratio is meaningful. The ingress is fine — look at the service behind it: its logs, its readiness, and whatever shipped last."
+              summary: "Service demo-prod-web@kubernetes is serving over 5% errors"
+
+  - name: the platform over 2 GiB RSS on average, held, warns; a tenant's memory never counts
+    interval: 1m
+    input_series:
+      - series: container_memory_rss{namespace="monitoring",pod="prom-0",container="prometheus"}
+        values: "2500000000x40"
+      - series: kube_namespace_labels{namespace="monitoring"}
+        values: "1x40"
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: OrbitPlatformMemoryOverBudget
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              description: "The platform namespaces (tenants excluded) are holding more than 2 GiB of resident memory (RSS; file cache is not counted). Find what grew — usually Prometheus retention, Grafana renders, or a sidecar that stopped sharing — before the kubelet starts choosing victims."
+              summary: "Platform memory is over its 2 GiB budget"
+
+  - name: a reboot's few minutes of WAL replay over budget never even goes pending
+    interval: 1m
+    input_series:
+      # measured shape (2026-10-05): 1.6 GiB, two minutes down, about 2.8 GiB for three
+      # minutes of WAL replay, then 1.6 GiB again
+      - series: container_memory_rss{namespace="monitoring",pod="prom-0",container="prometheus"}
+        values: "1600000000x30 _x2 3000000000x3 1600000000x40"
+      - series: kube_namespace_labels{namespace="monitoring"}
+        values: "1x30 _x2 1x43"
+    alert_rule_test:
+      - eval_time: 36m
+        alertname: OrbitPlatformMemoryOverBudget
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: OrbitPlatformMemoryOverBudget
+        exp_alerts: []
+    # exp_alerts sees firing alerts only; pending is what S16 caught, so ask ALERTS
+    promql_expr_test:
+      - expr: max_over_time(ALERTS{alertname="OrbitPlatformMemoryOverBudget"}[70m])
+        eval_time: 70m
+        exp_samples: []
+
+  - name: a tenant's 5 GiB does not put a 1 GiB platform over budget
+    interval: 1m
+    input_series:
+      - series: container_memory_rss{namespace="monitoring",pod="prom-0",container="prometheus"}
+        values: "1000000000x40"
+      - series: kube_namespace_labels{namespace="monitoring"}
+        values: "1x40"
+      - series: container_memory_rss{namespace="demo-prod",pod="api-0",container="api"}
+        values: "5000000000x40"
+      - series: kube_namespace_labels{namespace="demo-prod",label_orbit_local_project="demo"}
+        values: "1x40"
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: OrbitPlatformMemoryOverBudget
+        exp_alerts: []
+
+  # ── databases ────────────────────────────────────────────────────────────────────────
+  - name: a database whose exporter cannot reach Postgres for 5m is down
+    interval: 1m
+    input_series:
+      - series: cnpg_collector_up{namespace="demo-prod",cluster="demo-db",pod="demo-db-1"}
+        values: "1 1 0x10"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: OrbitDatabaseDown
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: OrbitDatabaseDown
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: demo-prod, cluster: demo-db, pod: demo-db-1}
+            exp_annotations:
+              description: "Postgres in demo-db-1 is not serving (CloudNativePG's exporter cannot reach it, or its container is not ready). The application's reads and writes are failing; check the cluster's status (fenced? hibernated?), the instance pod's logs and its volume."
+              summary: "demo-prod: database demo-db is not answering"
+
+  - name: a fenced database (collector still 1, postgres container not ready) is down; a tenant container named postgres is not
+    interval: 1m
+    input_series:
+      # measured 2026-10-05 on checkers-lab-dev, fenced: cnpg_collector_up stayed 1
+      - series: cnpg_collector_up{namespace="demo-prod",cluster="demo-db",pod="demo-db-1"}
+        values: "1x20"
+      - series: kube_pod_container_status_ready{namespace="demo-prod",pod="demo-db-1",container="postgres"}
+        values: "1 1 0x18"
+      # a tenant's own container named postgres, in a pod CNPG does not run: never this alert
+      - series: kube_pod_container_status_ready{namespace="demo-prod",pod="api-0",container="postgres"}
+        values: "0x20"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: OrbitDatabaseDown
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: OrbitDatabaseDown
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: demo-prod, cluster: demo-db, pod: demo-db-1}
+            exp_annotations:
+              description: "Postgres in demo-db-1 is not serving (CloudNativePG's exporter cannot reach it, or its container is not ready). The application's reads and writes are failing; check the cluster's status (fenced? hibernated?), the instance pod's logs and its volume."
+              summary: "demo-prod: database demo-db is not answering"
+
+  # ── latency ──────────────────────────────────────────────────────────────────────────
+  - name: p95 over a second at 1 req/s for 10m is slow; fast traffic is not
+    interval: 1m
+    input_series:
+      # every request lands in the 2.5s bucket: p95 is between 1s and 2.5s
+      - series: traefik_service_request_duration_seconds_bucket{service="demo-prod-web@kubernetes",le="0.5"}
+        values: "0x30"
+      - series: traefik_service_request_duration_seconds_bucket{service="demo-prod-web@kubernetes",le="1"}
+        values: "0x30"
+      - series: traefik_service_request_duration_seconds_bucket{service="demo-prod-web@kubernetes",le="2.5"}
+        values: "0+60x30"
+      - series: traefik_service_request_duration_seconds_bucket{service="demo-prod-web@kubernetes",le="+Inf"}
+        values: "0+60x30"
+      - series: traefik_service_request_duration_seconds_count{service="demo-prod-web@kubernetes"}
+        values: "0+60x30"
+      # a fast service: every request under 0.5s
+      - series: traefik_service_request_duration_seconds_bucket{service="fast@kubernetes",le="0.5"}
+        values: "0+60x30"
+      - series: traefik_service_request_duration_seconds_bucket{service="fast@kubernetes",le="1"}
+        values: "0+60x30"
+      - series: traefik_service_request_duration_seconds_bucket{service="fast@kubernetes",le="2.5"}
+        values: "0+60x30"
+      - series: traefik_service_request_duration_seconds_bucket{service="fast@kubernetes",le="+Inf"}
+        values: "0+60x30"
+      - series: traefik_service_request_duration_seconds_count{service="fast@kubernetes"}
+        values: "0+60x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: OrbitIngressLatencyHigh
+        exp_alerts:
+          - exp_labels: {severity: warning, service: "demo-prod-web@kubernetes"}
+            exp_annotations:
+              description: "The 95th percentile of this Traefik service's response time has been above one second for ten minutes. Look at the service's traces for the slow span and at whatever shipped last."
+              summary: "Service demo-prod-web@kubernetes answers slowly (p95 over 1s)"
+
+  # ── watching the watchers ────────────────────────────────────────────────────────────
+  - name: no log lines for 15 minutes is critical; lines arriving are not
+    interval: 1m
+    input_series:
+      - series: loki_distributor_lines_received_total{job="loki/loki",tenant="fake"}
+        values: "100+50x10 600x30"
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: OrbitLogsNotArriving
+        exp_alerts: []
+      - eval_time: 38m
+        alertname: OrbitLogsNotArriving
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              description: "Loki's distributor has received no lines for fifteen minutes. Alloy, Loki or the path between them is broken, and every log-based check is blind until it is fixed."
+              summary: "No log lines are reaching Loki"
+
+  - name: a burst Loki refuses pages; no discards never do
+    interval: 1m
+    input_series:
+      - series: loki_discarded_samples_total{job="loki/loki",reason="rate_limited",tenant="fake"}
+        values: "0x5 0+500x20"
+      - series: loki_discarded_samples_total{job="loki/loki",reason="stream_limit",tenant="fake"}
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: OrbitLogsDiscarded
+        exp_alerts: []
+      - eval_time: 14m
+        alertname: OrbitLogsDiscarded
+        exp_alerts:
+          - exp_labels: {severity: warning, reason: rate_limited}
+            exp_annotations:
+              summary: "Loki is discarding log lines (rate_limited)"
+              description: "Loki refused log lines in the last ten minutes for rate_limited: a burst past the ingestion rate, too many streams, or lines too old or too long. Those lines are lost; find the noisy pod in Loki's own metrics."
+
+  - name: a target over its sample limit pages; none over it never does
+    interval: 1m
+    input_series:
+      - series: prometheus_target_scrapes_exceeded_sample_limit_total{job="kube-prometheus-stack-prometheus",instance="p"}
+        values: "0x5 1+2x20"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: OrbitScrapeSampleLimitHit
+        exp_alerts: []
+      - eval_time: 14m
+        alertname: OrbitScrapeSampleLimitHit
+        exp_alerts:
+          - exp_labels: {severity: warning, job: kube-prometheus-stack-prometheus, instance: p}
+            exp_annotations:
+              summary: "A scrape target exceeds its sample limit (a label explosion)"
+              description: "At least one target returned more samples than its limit and was not scraped. Its metrics are missing until its cardinality comes down; find it among the targets reporting up == 0."
+
+  - name: S3 errors from Loki for 10m warn
+    interval: 1m
+    input_series:
+      - series: loki_s3_request_duration_seconds_count{job="loki/loki",operation="S3.PutObject",status_code="403"}
+        values: "0+5x30"
+      - series: loki_s3_request_duration_seconds_count{job="loki/loki",operation="S3.PutObject",status_code="200"}
+        values: "0+5x30"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: OrbitObjectStoreFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, job: loki/loki}
+            exp_annotations:
+              description: "Requests to the platform bucket are failing. Logs are held locally until it recovers and are lost if the pod restarts first. Check the orbit-s3 credential, the bucket and the endpoint."
+              summary: "loki/loki cannot write to the object store"
+
+  - name: a bucket that stops answering (uploads stop, no status recorded) warns; a quiet Loki does not
+    interval: 1m
+    input_series:
+      # measured shape: uploads about once a minute, then nothing at all from minute 20
+      - series: loki_s3_request_duration_seconds_count{job="loki/loki",operation="S3.PutObject",status_code="200"}
+        values: "0+1x20 20x40"
+      - series: loki_distributor_lines_received_total{job="loki/loki"}
+        values: "0+100x60"
+      # a second Loki with no lines arriving and no uploads: idle, not failing
+      - series: loki_s3_request_duration_seconds_count{job="loki/idle",operation="S3.PutObject",status_code="200"}
+        values: "5x60"
+      - series: loki_distributor_lines_received_total{job="loki/idle"}
+        values: "1000x60"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: OrbitObjectStoreFailing
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: OrbitObjectStoreFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, job: loki/loki}
+            exp_annotations:
+              description: "Requests to the platform bucket are failing. Logs are held locally until it recovers and are lost if the pod restarts first. Check the orbit-s3 credential, the bucket and the endpoint."
+              summary: "loki/loki cannot write to the object store"
+
+  - name: a Loki that started under 45 minutes ago and has not uploaded yet does not warn; the same silence later does
+    interval: 1m
+    input_series:
+      # measured shape on a platform an hour old: one upload early, then none until the
+      # first chunks are due, lines arriving throughout
+      - series: loki_s3_request_duration_seconds_count{job="loki/loki",operation="S3.PutObject",status_code="200"}
+        values: "0 1x120"
+      - series: loki_distributor_lines_received_total{job="loki/loki"}
+        values: "0+100x120"
+      - series: process_start_time_seconds{job="loki/loki"}
+        values: "0x120"
+    alert_rule_test:
+      - eval_time: 33m
+        alertname: OrbitObjectStoreFailing
+        exp_alerts: []
+      - eval_time: 44m
+        alertname: OrbitObjectStoreFailing
+        exp_alerts: []
+      # still nothing uploaded an hour in: that is a bucket that does not answer
+      - eval_time: 60m
+        alertname: OrbitObjectStoreFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, job: loki/loki}
+            exp_annotations:
+              description: "Requests to the platform bucket are failing. Logs are held locally until it recovers and are lost if the pod restarts first. Check the orbit-s3 credential, the bucket and the endpoint."
+              summary: "loki/loki cannot write to the object store"
+
+  - name: a new Loki the bucket REFUSES warns at once, start time or not
+    interval: 1m
+    input_series:
+      - series: loki_s3_request_duration_seconds_count{job="loki/loki",operation="S3.PutObject",status_code="403"}
+        values: "0+5x30"
+      - series: process_start_time_seconds{job="loki/loki"}
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: OrbitObjectStoreFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, job: loki/loki}
+            exp_annotations:
+              description: "Requests to the platform bucket are failing. Logs are held locally until it recovers and are lost if the pod restarts first. Check the orbit-s3 credential, the bucket and the endpoint."
+              summary: "loki/loki cannot write to the object store"
+
+  - name: failed Tempo flushes warn
+    interval: 1m
+    input_series:
+      - series: tempo_ingester_failed_flushes_total{job="tempo"}
+        values: "0x5 1+1x30"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: OrbitObjectStoreFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, job: tempo}
+            exp_annotations:
+              description: "Requests to the platform bucket are failing. Traces are held locally until it recovers and are lost if the pod restarts first. Check the orbit-s3 credential, the bucket and the endpoint."
+              summary: "tempo cannot write to the object store"

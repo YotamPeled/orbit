@@ -1,0 +1,182 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+
+# Lock the observability plane's ingress (audit 2026-08-28 HIGH). The monitoring namespace
+# carried NO NetworkPolicy except the chart's own image-renderer one, so from any pod in the
+# cluster — including any internet-facing tenant pod — Prometheus answered queries
+# AND remote-write on :9090, Grafana was reachable, and Alertmanager's :9093 accepted
+# /api/v2/silences unauthenticated: a compromised public pod could silence the alerts about
+# its own compromise. auth_enabled is off on all of it; the network was the only missing gate.
+#
+# These select ONLY the three sensitive workloads and switch each to default-deny ingress,
+# admitting same-namespace platform components (Grafana's query to Prometheus, Prometheus's
+# scrape of every pod here, the image-renderer's callback to Grafana, Prometheus -> Alertmanager
+# alerts) plus the one legitimate cross-namespace caller each has. They are Ingress-only:
+# Prometheus's egress — the scrape of the whole cluster — is untouched. The fourth policy
+# closes the two exporters that DO answer with data: kube-state-metrics serves every
+# namespace, pod, image, ingress host and Secret NAME in the cluster, and blackbox-exporter
+# is an unauthenticated fetcher (/probe?target=) a tenant pod could point at addresses its
+# own egress policy blocks. Both are scraped only from inside this namespace. node-exporter
+# and the operator stay open: node-exporter runs on the host network, where a namespaced
+# policy does not reliably apply, and the operator serves nothing a tenant can use. Kubelet
+# health probes come from the node and are not policed by this CNI (proven by the app
+# namespaces' default-deny, which runs healthy with probes).
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prometheus-ingress
+  namespace: monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus
+  policyTypes: [Ingress]
+  ingress:
+    # Same-namespace: Grafana queries :9090, Prometheus scrapes its own /metrics.
+    - from:
+        - podSelector: {}
+    # Tempo's metrics-generator remote-writes span metrics to :9090/api/v1/write.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: tempo
+      ports:
+        - {protocol: TCP, port: 9090}
+    # orbitd reads Prometheus on :9090.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: orbit
+      ports:
+        - {protocol: TCP, port: 9090}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: grafana-ingress
+  namespace: monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: grafana
+  policyTypes: [Ingress]
+  ingress:
+    # Same-namespace: Prometheus scrapes Grafana's /metrics, the image-renderer fetches
+    # pages back from Grafana on :3000.
+    - from:
+        - podSelector: {}
+    # The UI, via Traefik. Service port 80 -> targetPort 3000; NetworkPolicy matches the
+    # container port.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+      ports:
+        - {protocol: TCP, port: 3000}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: alertmanager-ingress
+  namespace: monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: alertmanager
+  policyTypes: [Ingress]
+  ingress:
+    # Same-namespace: Prometheus fires alerts to :9093 and scrapes it; the gossip port
+    # is self-directed at one replica.
+    - from:
+        - podSelector: {}
+    # The Loki ruler POSTs firing alerts to :9093 (rulerConfig.alertmanager_url — the agent
+    # plane's `logs` triggers are evaluated by Loki, not Prometheus, so this is the only path
+    # by which a logs trigger can ever reach a human or an agent).
+    #
+    # BE HONEST ABOUT THE FULL BLAST RADIUS — it is NOT "just silences". Alertmanager has NO
+    # authentication and NO authorization: opening :9093 to anything opens the ENTIRE v2 API
+    # to it, and an unauthenticated POST /api/v2/alerts is a live weapon in three distinct
+    # ways, not one:
+    #
+    #   (a) IT DISPATCHES AN AGENT, fully authenticated. A forged alert with an alertname of
+    #       the form `OrbitAgent*` and status `firing` matches the generic route below and is
+    #       delivered to the orbit-intake receiver — and the intake's bearer is supplied BY
+    #       ALERTMANAGER from credentials_file, so the POST the intake sees is authenticated
+    #       and byte-for-byte indistinguishable from a real ruler alert. The intake's
+    #       routes.json matches on {alertname, status} only, both of which the forger writes.
+    #       The forged alert therefore runs an agent's tooling and spends the org
+    #       subscription — a machine work item conjured from nothing.
+    #   (b) IT PAGES A HUMAN with attacker-authored text. A forged alert routed to the default
+    #       telegram receiver renders `.Annotations.summary` and `.Annotations.description`
+    #       straight into the on-call channel — content the attacker controls, delivered with
+    #       the platform's own voice.
+    #   (c) IT IS A SECOND SUPPRESSION PRIMITIVE, on top of POST /api/v2/silences. The inhibit
+    #       rules equal on [namespace, alertname]; a forged `severity=critical` sibling
+    #       carrying a real warning's namespace+alertname inhibits that real warning before it
+    #       is ever notified. Silencing is not even required to blind the operator.
+    #
+    # So the honest one-line cost is: whoever reaches :9093 can dispatch agents, page humans
+    # with chosen text, and suppress alerts two different ways. Silencing your own alert is the
+    # least of it.
+    #
+    # ACCEPTED anyway, with the reasoning recorded rather than waved at:
+    #   - Loki is not internet-facing (no Ingress, no LoadBalancer; reached only by Alloy and
+    #     Grafana on the cluster network), so this is not a path from the internet — it is a
+    #     second-hop privilege for something that must already be breached.
+    #   - The ruler has no other delivery path: alertmanager_url is the ONLY way a Loki
+    #     alerting rule reaches anything. The alternative is having no logs triggers at all.
+    #   - BUT DO NOT MISREAD "must already be breached" AS "low-value target." The log store
+    #     parses attacker-influenced bytes from EVERY namespace, auth_enabled:false — including
+    #     an internet-facing tenant pod, whose access logs stream straight into this
+    #     Loki. A parser bug reachable from those bytes is a real path to this privilege, so
+    #     the ingress below is narrowed as tightly as this layer allows (see the from-element).
+    #
+    # NARROWING *IS* AVAILABLE AT THIS LAYER — at pod granularity. NetworkPolicy cannot select
+    # on HTTP path, so "alerts yes, silences no" still needs an authenticating proxy in front
+    # of Alertmanager (the thing to build before admitting a SECOND namespace here). But it CAN
+    # select on pod labels: the from-element below carries BOTH a namespaceSelector AND a
+    # podSelector in the SAME array element (an AND), so this admits only the one Loki ruler
+    # pod — `app.kubernetes.io/name: loki`, verified live to select exactly loki-0 — NOT the
+    # whole `loki` namespace. This matters because ns loki has no default-deny of its own
+    # (config/loki/netpol.yaml selects only the loki pod), a loki-memcached ServiceAccount
+    # already exists so a chart values flip could add cache pods, and the generator is
+    # permitted to address ns loki: any of those would silently inherit namespace-wide access.
+    # The podSelector denies them the door.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: loki
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: loki
+      ports:
+        - {protocol: TCP, port: 9093}
+    # orbitd reads Alertmanager on :9093.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: orbit
+      ports:
+        - {protocol: TCP, port: 9093}
+---
+# The exporters that answer with data: reachable from this namespace only (Prometheus
+# scrapes kube-state-metrics; Probe objects drive blackbox-exporter through Prometheus).
+# The blackbox chart labels its pod by the chart name, whatever fullnameOverride says.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: exporters-ingress
+  namespace: monitoring
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values: [kube-state-metrics, prometheus-blackbox-exporter, blackbox-exporter]
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}

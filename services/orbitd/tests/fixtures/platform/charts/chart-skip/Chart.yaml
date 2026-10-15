@@ -1,0 +1,4 @@
+apiVersion: v2
+name: chart-skip
+version: 0.1.0
+description: fixture chart whose CRDs are skipped

@@ -1,0 +1,8 @@
+terraform.tfstate*
+.terraform/
+# The dependency lock. Not committed for the same reason the server module never had one:
+# `tofu init` records platform-specific provider hashes, and an org whose operator works
+# from a different OS than the one that cut the file gets a lock it must delete to init.
+# The version pin lives in versions.tf, which is where a review can see it.
+.terraform.lock.hcl
+*.auto.tfvars

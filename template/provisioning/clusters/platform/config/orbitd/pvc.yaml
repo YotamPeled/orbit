@@ -1,0 +1,17 @@
+# GENERATED into clusters/ by `make init` from instance/config.yaml.
+# Do not edit the copy under clusters/ (a re-run overwrites it), nor this staged source:
+# provisioning/ is vendored from orbit-core at the pin, and `make core-sync` replaces it.
+# Change the text in orbit-core and bump the pin.
+# Durable state for the signing key, the principal store and the revocation list.
+# No storageClassName: the instance's default class. ReadWriteOnce, so the Deployment
+# rolls with Recreate — two writers on this claim cannot share it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: orbitd
+  namespace: orbit
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi

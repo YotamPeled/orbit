@@ -1,0 +1,20 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: chart-a
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: charts
+    chart: chart-a
+    targetRevision: 0.1.0
+    helm:
+      valuesObject:
+        image: example/a:1
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: proj-a
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions: [CreateNamespace=true]

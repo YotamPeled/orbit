@@ -1,0 +1,18 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: classes
+  namespace: argocd
+  annotations:
+    orbit.local/generated-secrets: minted
+spec:
+  project: default
+  source:
+    repoURL: https://git.example.invalid/repo.git
+    targetRevision: main
+    path: clusters/platform/config
+    directory:
+      recurse: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ns-a
